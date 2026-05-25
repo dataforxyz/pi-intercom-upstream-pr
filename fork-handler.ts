@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildForkHandlerEnv, buildForkRunPaths, buildPiForkArgs, getForkHandlersFile, launchDetachedFork, readOptionalText, truncateText, writeJsonAtomic } from "./fork-runtime.ts";
@@ -8,6 +9,7 @@ import type { Message, SessionInfo } from "./types.ts";
 const HANDLER_MESSAGE_TYPE = "intercom_fork_handler";
 const HANDLERS_FILE = getForkHandlersFile("intercom");
 const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
+const SUBAGENT_RESULT_INLINE_LIMIT_BYTES = 8 * 1024;
 
 export type InboundForkWhen = "busy" | "always";
 export type InboundForkNotify = "ack-and-summary" | "summary" | "none";
@@ -37,6 +39,9 @@ export interface IntercomForkHandlerRun {
   cwd: string;
   parentSessionFile?: string;
   forkSessionFile?: string;
+  inboundBodyPath?: string;
+  inboundBodyBytes?: number;
+  inboundBodyCompacted?: boolean;
   parentSessionId?: string;
   parentSessionName?: string;
   dir: string;
@@ -121,7 +126,24 @@ function getParentSessionName(pi: ExtensionAPI): string | undefined {
   }
 }
 
-function buildEventPayload(entry: InboundForkMessageEntry, run: IntercomForkHandlerRun, ctx: ExtensionContext, pi: ExtensionAPI) {
+function isSubagentResultEntry(entry: InboundForkMessageEntry): boolean {
+  return entry.from.id === "subagent-result" || entry.from.name === "subagent-result";
+}
+
+function compactBodyForFork(entry: InboundForkMessageEntry, run: IntercomForkHandlerRun): string {
+  if (!run.inboundBodyCompacted || !run.inboundBodyPath) return entry.bodyText;
+  return [
+    `[pi-intercom compacted this large subagent-result message for the fork handler prompt.]`,
+    `Full inbound message: ${run.inboundBodyPath}`,
+    `Original size: ${run.inboundBodyBytes ?? Buffer.byteLength(entry.bodyText, "utf8")} bytes`,
+    "Read that file only if the summary/artifact/session paths below are not enough.",
+    "",
+    truncateText(entry.bodyText, SUBAGENT_RESULT_INLINE_LIMIT_BYTES),
+  ].join("\n");
+}
+
+export function buildIntercomForkEventPayload(entry: InboundForkMessageEntry, run: IntercomForkHandlerRun, ctx: ExtensionContext, pi: ExtensionAPI) {
+  const bodyText = compactBodyForFork(entry, run);
   return {
     version: 1,
     type: entry.message.expectsReply ? "intercom.ask" : "intercom.message",
@@ -138,8 +160,9 @@ function buildEventPayload(entry: InboundForkMessageEntry, run: IntercomForkHand
       replyTo: entry.message.replyTo,
       expectsReply: entry.message.expectsReply === true,
       from: entry.from,
-      bodyText: entry.bodyText,
-      content: entry.message.content,
+      bodyText,
+      content: { ...entry.message.content, text: bodyText },
+      ...(run.inboundBodyPath ? { fullBodyTextPath: run.inboundBodyPath, fullBodyTextBytes: run.inboundBodyBytes } : {}),
       timestamp: entry.message.timestamp,
     },
     authority: {
@@ -201,6 +224,7 @@ export function buildIntercomForkHandlerPrompt(entry: InboundForkMessageEntry, r
     "",
     `Handler id: ${run.id}`,
     `Event JSON path: ${run.eventPath}`,
+    ...(run.inboundBodyPath ? [`Full inbound message path: ${run.inboundBodyPath} (${run.inboundBodyBytes ?? "unknown"} bytes; prompt payload is compacted)`] : []),
     "",
     "Intercom event payload:",
     "```json",
@@ -360,8 +384,15 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
     triggerParentOnSummary: config.triggerParentOnSummary,
     startedAt: Date.now(),
   };
-  const eventJson = JSON.stringify(buildEventPayload(entry, run, ctx, pi), null, 2);
   await fsp.mkdir(run.sessionDir, { recursive: true });
+  const inboundBodyBytes = Buffer.byteLength(entry.bodyText, "utf8");
+  if (isSubagentResultEntry(entry) && inboundBodyBytes > SUBAGENT_RESULT_INLINE_LIMIT_BYTES) {
+    run.inboundBodyPath = path.join(run.dir, "inbound-message.md");
+    run.inboundBodyBytes = inboundBodyBytes;
+    run.inboundBodyCompacted = true;
+    await fsp.writeFile(run.inboundBodyPath, entry.bodyText, "utf8");
+  }
+  const eventJson = JSON.stringify(buildIntercomForkEventPayload(entry, run, ctx, pi), null, 2);
   if (run.parentSessionFile) {
     const snapshotPath = `${run.dir}/parent-session-snapshot.jsonl`;
     try {

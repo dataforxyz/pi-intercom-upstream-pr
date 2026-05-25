@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
+import { buildIntercomForkEventPayload, buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
 
 function makeRun(): IntercomForkHandlerRun {
   return {
@@ -55,6 +55,27 @@ test("send fork handler prompt treats non-blocking messages as async summaries",
   const prompt = buildIntercomForkHandlerPrompt(makeEntry(false), makeRun(), JSON.stringify({ type: "intercom.message" }, null, 2));
   assert.match(prompt, /non-blocking intercom send/i);
   assert.match(prompt, /summarize only what matters/i);
+});
+
+test("large subagent-result payloads are compacted for fork handler prompts", () => {
+  const entry = makeEntry(false);
+  entry.from.id = "subagent-result";
+  entry.from.name = "subagent-result";
+  entry.bodyText = `subagent results\n\nRun: async-1\nStatus: completed\n\n1. worker — completed\nOutput artifact: /tmp/result.md\nSession: /tmp/session.jsonl\nSummary:\n${"detail\n".repeat(2000)}`;
+  entry.message.content.text = entry.bodyText;
+  const run = {
+    ...makeRun(),
+    inboundBodyPath: "/tmp/pi-intercom/handlers/icfh_test/inbound-message.md",
+    inboundBodyBytes: Buffer.byteLength(entry.bodyText, "utf8"),
+    inboundBodyCompacted: true,
+  };
+  const payload = buildIntercomForkEventPayload(entry, run, { cwd: "/tmp/project" } as any, { getSessionName: () => "parent" } as any) as any;
+  assert.equal(payload.payload.fullBodyTextPath, run.inboundBodyPath);
+  assert.match(payload.payload.bodyText, /compacted this large subagent-result message/);
+  assert.match(payload.payload.bodyText, /Full inbound message: \/tmp\/pi-intercom/);
+  assert.ok(payload.payload.bodyText.length < entry.bodyText.length);
+  const prompt = buildIntercomForkHandlerPrompt(entry, run, JSON.stringify(payload, null, 2));
+  assert.match(prompt, /Full inbound message path:/);
 });
 
 test("system prompt constrains fork handler to the intercom event capsule", () => {
