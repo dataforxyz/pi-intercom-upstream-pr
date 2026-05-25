@@ -74,6 +74,23 @@ test("does not compact intercom handler receipts with later actionable blocker l
   assert.deepEqual(compactIntercomHandlerMessages([receipt]), [receipt]);
 });
 
+test("does not compact duplicate/conflict/stopped coordination receipts", () => {
+  const receipt = {
+    role: "custom",
+    customType: "intercom_fork_handler",
+    content: [
+      "intercom fork handler complete: incoming message",
+      "Handler: icfh_123",
+      "Exit: 0",
+      "Output: /tmp/out.log (10 B)",
+      "Errors: none (/tmp/err.log, 0 B)",
+      "Stopped per duplicate-worker notice after de-conflict check; no parent follow-up needed.",
+    ].join("\n"),
+  };
+
+  assert.deepEqual(compactIntercomHandlerMessages([receipt]), [receipt]);
+});
+
 test("preserves long intercom log lookup pointers without truncation", () => {
   const longOutput = `/tmp/${"a".repeat(350)}/stdout.log`;
   const longErrors = `/tmp/${"b".repeat(350)}/stderr.log`;

@@ -24,7 +24,7 @@ function hasEmptyOrAbsentErrorsLine(lines: string[]): boolean {
 }
 
 function hasInlineActionMarker(lines: string[]): boolean {
-  return lines.some((line) => /\b(failed|failure|error|blocked|blocker|needs?[-\s]+attention|needs?[-\s]+parent|parent[-\s]+decision|needs?[-\s]+decision|action[-\s]+required|escalat(?:e|ed|ion))\b/i.test(line));
+  return lines.some((line) => /\b(failed|failure|error|blocked|blocker|needs?[-\s]+attention|needs?[-\s]+parent|parent[-\s]+decision|needs?[-\s]+decision|action[-\s]+required|escalat(?:e|ed|ion)|duplicates?|de[-\s]?conflict(?:ed|ion)?|conflicts?|stopp?ed|stop[-\s]+request|superseded)\b/i.test(line));
 }
 
 function isRoutineSuccessfulHandlerReceipt(content: string): boolean {
