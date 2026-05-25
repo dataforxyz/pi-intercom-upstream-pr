@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildForkHandlerEnv, buildForkRunPaths, buildPiForkArgs, getForkHandlersFile, launchDetachedFork, readOptionalText, truncateText, writeJsonAtomic } from "./fork-runtime.ts";
 import type { Message, SessionInfo } from "./types.ts";
 
