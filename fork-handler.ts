@@ -10,6 +10,10 @@ const HANDLER_MESSAGE_TYPE = "intercom_fork_handler";
 const HANDLERS_FILE = getForkHandlersFile("intercom");
 const HANDLER_SUMMARY_LIMIT_BYTES = 24 * 1024;
 const SUBAGENT_RESULT_INLINE_LIMIT_BYTES = 8 * 1024;
+const INTERCOM_PARENT_SESSION_FILE_ENV = "PI_INTERCOM_PARENT_SESSION_FILE";
+const INTERCOM_PARENT_SESSION_ID_ENV = "PI_INTERCOM_PARENT_SESSION_ID";
+const INTERCOM_PARENT_SESSION_NAME_ENV = "PI_INTERCOM_PARENT_SESSION_NAME";
+const INTERCOM_PARENT_INTERCOM_TARGET_ENV = "PI_INTERCOM_PARENT_INTERCOM_TARGET";
 
 export type InboundForkWhen = "busy" | "always";
 export type InboundForkNotify = "ack-and-summary" | "summary" | "none";
@@ -44,6 +48,7 @@ export interface IntercomForkHandlerRun {
   inboundBodyCompacted?: boolean;
   parentSessionId?: string;
   parentSessionName?: string;
+  parentIntercomTarget?: string;
   dir: string;
   eventPath: string;
   promptPath: string;
@@ -126,6 +131,15 @@ function getParentSessionName(pi: ExtensionAPI): string | undefined {
   }
 }
 
+function resolveParentIntercomTarget(pi: ExtensionAPI, ctx: ExtensionContext): string | undefined {
+  const name = getParentSessionName(pi)?.trim();
+  if (name) return name;
+  const sessionId = getSessionId(ctx);
+  if (!sessionId) return undefined;
+  const normalized = sessionId.startsWith("session-") ? sessionId.slice("session-".length) : sessionId;
+  return `subagent-chat-${normalized.slice(0, 8)}`;
+}
+
 function isSubagentResultEntry(entry: InboundForkMessageEntry): boolean {
   return entry.from.id === "subagent-result" || entry.from.name === "subagent-result";
 }
@@ -154,7 +168,7 @@ export function buildIntercomForkEventPayload(entry: InboundForkMessageEntry, ru
     parentSessionFile: run.parentSessionFile,
     parentSessionId: run.parentSessionId,
     parentSessionName: run.parentSessionName,
-    parentIntercomTarget: getParentSessionName(pi),
+    parentIntercomTarget: run.parentIntercomTarget,
     payload: {
       messageId: entry.message.id,
       replyTo: entry.message.replyTo,
@@ -370,6 +384,10 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
   await loadHandlers();
   const id = makeHandlerId(entry.message);
   const paths = buildForkRunPaths("intercom", id);
+  const parentSessionFile = getSessionFile(ctx);
+  const parentSessionId = getSessionId(ctx);
+  const parentSessionName = getParentSessionName(pi);
+  const parentIntercomTarget = resolveParentIntercomTarget(pi, ctx);
   const run: IntercomForkHandlerRun = {
     ...paths,
     eventId: `intercom_${entry.message.id}`,
@@ -377,9 +395,10 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
     from: entry.from.name || entry.from.id,
     status: "starting",
     cwd: ctx.cwd ?? process.cwd(),
-    ...(getSessionFile(ctx) ? { parentSessionFile: getSessionFile(ctx) } : {}),
-    ...(getSessionId(ctx) ? { parentSessionId: getSessionId(ctx) } : {}),
-    ...(getParentSessionName(pi) ? { parentSessionName: getParentSessionName(pi) } : {}),
+    ...(parentSessionFile ? { parentSessionFile } : {}),
+    ...(parentSessionId ? { parentSessionId } : {}),
+    ...(parentSessionName ? { parentSessionName } : {}),
+    ...(parentIntercomTarget ? { parentIntercomTarget } : {}),
     notify: config.notify,
     triggerParentOnSummary: config.triggerParentOnSummary,
     startedAt: Date.now(),
@@ -418,7 +437,10 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
       stderrPath: run.stderrPath,
       env: buildForkHandlerEnv("intercom", run.id, {
         ...process.env,
-        ...(run.parentSessionFile ? { PI_INTERCOM_PARENT_SESSION_FILE: run.parentSessionFile } : {}),
+        ...(run.parentSessionFile ? { [INTERCOM_PARENT_SESSION_FILE_ENV]: run.parentSessionFile } : {}),
+        ...(run.parentSessionId ? { [INTERCOM_PARENT_SESSION_ID_ENV]: run.parentSessionId } : {}),
+        ...(run.parentSessionName ? { [INTERCOM_PARENT_SESSION_NAME_ENV]: run.parentSessionName } : {}),
+        ...(run.parentIntercomTarget ? { [INTERCOM_PARENT_INTERCOM_TARGET_ENV]: run.parentIntercomTarget } : {}),
       }),
       onClose: (code, signal) => {
         void markHandlerFinished(pi, run.id, code, signal, config.notify, config.triggerParentOnSummary).catch((error) => {
