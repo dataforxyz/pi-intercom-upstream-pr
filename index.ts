@@ -421,6 +421,30 @@ function previewText(value: unknown, maxLength = 72): string | undefined {
 function firstTextContent(result: { content?: Array<{ type: string; text?: string }> }): string {
   return result.content?.find((item) => item.type === "text" && typeof item.text === "string")?.text?.replace(/\*\*/g, "") ?? "";
 }
+
+export function chooseContactTarget(currentSession: SessionInfo, sessions: SessionInfo[]): { target: string; name?: string; id: string; duplicateName: boolean } {
+  const duplicates = duplicateSessionNames(sessions);
+  const name = currentSession.name?.trim() || undefined;
+  const duplicateName = Boolean(name && duplicates.has(name.toLowerCase()));
+  return {
+    target: name && !duplicateName ? name : currentSession.id,
+    ...(name ? { name } : {}),
+    id: currentSession.id,
+    duplicateName,
+  };
+}
+
+export function formatContactInstruction(contact: { target: string; id: string; name?: string; duplicateName?: boolean }): string {
+  const lines = [
+    "Contact me when you're done via pi-intercom:",
+    `intercom({ action: "send", to: ${JSON.stringify(contact.target)}, message: "..." })`,
+    "",
+    `Intercom target: ${contact.target}`,
+  ];
+  if (contact.name && contact.target !== contact.name) lines.push(`Session name: ${contact.name}${contact.duplicateName ? " (not used because it is duplicated)" : ""}`);
+  if (contact.id !== contact.target) lines.push(`Session ID fallback: ${contact.id}`);
+  return lines.join("\n");
+}
 export default function piIntercomExtension(pi: ExtensionAPI) {
   applyForkHandlerSessionName(pi);
   let client: IntercomClient | null = null;
@@ -1767,6 +1791,56 @@ Usage:
     },
   });
 
+  async function resolveCurrentContact(ctx: ExtensionContext, generation = runtimeGeneration): Promise<{ target: string; name?: string; id: string; duplicateName: boolean } | undefined> {
+    let contactClient: IntercomClient;
+    try {
+      contactClient = await ensureConnected("overlay");
+    } catch (error) {
+      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", generation);
+      return undefined;
+    }
+    if (!getLiveContext(ctx, generation)) return undefined;
+    syncPresenceIdentity(ctx.sessionManager.getSessionId());
+    try {
+      const sessions = await contactClient.listSessions();
+      const currentSession = sessions.find(s => s.id === contactClient.sessionId);
+      if (!currentSession) {
+        return { target: contactClient.sessionId, id: contactClient.sessionId, duplicateName: false };
+      }
+      return chooseContactTarget(currentSession, sessions);
+    } catch (error) {
+      notifyIfLive(ctx, `Failed to read intercom id: ${getErrorMessage(error)}`, "error", generation);
+      return undefined;
+    }
+  }
+
+  function insertIntoEditor(ctx: ExtensionContext, text: string): void {
+    const existing = ctx.ui.getEditorText?.() ?? "";
+    const next = existing.trim() ? `${existing.trimEnd()}\n\n${text}` : text;
+    ctx.ui.setEditorText(next);
+  }
+
+  async function showIntercomId(ctx: ExtensionContext, mode: "show" | "insert" = "show"): Promise<void> {
+    const generation = runtimeGeneration;
+    const liveContext = getLiveContext(ctx, generation);
+    if (!liveContext) return;
+    const contact = await resolveCurrentContact(liveContext, generation);
+    if (!contact || !getLiveContext(liveContext, generation)) return;
+    const instruction = formatContactInstruction(contact);
+    if (mode === "insert" && liveContext.hasUI) {
+      insertIntoEditor(liveContext, instruction);
+      notifyIfLive(liveContext, `Inserted intercom contact target: ${contact.target}`, "info", generation);
+      return;
+    }
+    pi.sendMessage({
+      customType: "intercom_contact_id",
+      content: instruction,
+      display: true,
+      details: contact,
+    });
+    notifyIfLive(liveContext, `Intercom contact target: ${contact.target}`, "info", generation);
+  }
+
   async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
     const overlayGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, overlayGeneration);
@@ -1841,6 +1915,14 @@ Usage:
     handler: async (_args, ctx) => openIntercomOverlay(ctx),
   });
 
+  pi.registerCommand("intercom-id", {
+    description: "Show this session's intercom contact target. Use /intercom-id insert to put a handoff snippet in the editor.",
+    handler: async (args, ctx) => {
+      const mode = args.trim().toLowerCase();
+      await showIntercomId(ctx, mode === "insert" || mode === "editor" ? "insert" : "show");
+    },
+  });
+
   pi.registerCommand("intercom-handlers", {
     description: "List inbound intercom fork handlers: /intercom-handlers [running|complete|failed|all]",
     handler: async (args, ctx) => {
@@ -1857,5 +1939,10 @@ Usage:
   pi.registerShortcut("alt+m", {
     description: "Open session intercom",
     handler: async (ctx) => openIntercomOverlay(ctx),
+  });
+
+  pi.registerShortcut("alt+i", {
+    description: "Insert this session's intercom contact target",
+    handler: async (ctx) => showIntercomId(ctx, "insert"),
   });
 }
