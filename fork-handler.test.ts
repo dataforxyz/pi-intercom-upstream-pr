@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildIntercomForkEventPayload, buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, cleanupParentSessionSnapshot, resolveTriggerParentOnSummary, shouldAutoTriggerParent, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
+import { buildHandlerArgs, buildIntercomForkEventPayload, buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, cleanupParentSessionSnapshot, fallbackSummaryForEmptyHandler, resolveTriggerParentOnSummary, shouldAutoTriggerParent, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
 
 function makeRun(): IntercomForkHandlerRun {
   return {
@@ -58,6 +58,7 @@ test("send fork handler prompt treats non-blocking messages as async summaries",
   const prompt = buildIntercomForkHandlerPrompt(makeEntry(false), makeRun(), JSON.stringify({ type: "intercom.message" }, null, 2));
   assert.match(prompt, /non-blocking intercom send/i);
   assert.match(prompt, /summarize only what matters/i);
+  assert.match(prompt, /do not use parent: "current"/i);
 });
 
 test("large subagent-result payloads are compacted for fork handler prompts", () => {
@@ -116,6 +117,21 @@ test("completed handlers delete their owned parent snapshot copy", async () => {
 test("system prompt constrains fork handler to the intercom event capsule", () => {
   const prompt = buildIntercomForkHandlerSystemPrompt(makeRun());
   assert.match(prompt, /only task is to handle the inbound intercom event capsule/i);
-  assert.match(prompt, /Do not continue unrelated inherited parent work/i);
+  assert.match(prompt, /forked parent snapshot/i);
   assert.match(prompt, /answer directly with intercom.send \+ replyTo/i);
+});
+
+test("intercom fork handlers fork the parent snapshot when available", () => {
+  const args = buildHandlerArgs({ ...makeRun(), parentSessionFile: "/tmp/parent.jsonl", forkSessionFile: "/tmp/snapshot.jsonl" });
+  assert.equal(args.includes("--fork"), true);
+  assert.equal(args.includes("/tmp/snapshot.jsonl"), true);
+  assert.equal(args.includes("/tmp/parent.jsonl"), false);
+  assert.ok(args.some((arg) => arg.startsWith("@")));
+});
+
+test("empty handler output falls back to the original intercom message", () => {
+  const summary = fallbackSummaryForEmptyHandler({ from: "worker" }, "Build finished successfully");
+  assert.match(summary, /without a final response/i);
+  assert.match(summary, /From: worker/);
+  assert.match(summary, /Build finished successfully/);
 });

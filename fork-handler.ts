@@ -260,12 +260,13 @@ export function buildIntercomForkHandlerPrompt(entry: InboundForkMessageEntry, r
   return [
     "You are a background pi-intercom handler running in a sibling Pi session.",
     "The parent chat is busy and should stay undistracted unless a real decision is needed.",
-    "Handle only the inbound intercom event capsule supplied here; do not continue unrelated inherited parent work.",
+    "This handler runs in a forked parent snapshot. Handle only the inbound intercom event capsule supplied here; use the forked transcript as context only and do not continue unrelated inherited parent work.",
     "",
     "Delegated authority:",
     "- Answer or act directly when the response is derivable from the inbound message, inherited context, repo files, local artifacts, or prior user instructions.",
     "- Escalate only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with parent work, or low confidence.",
     "- Use intercom.send for non-blocking notices. Use intercom.ask only for true blocking parent decisions.",
+    "- If you create return_on watchers or subagents whose result the parent needs, route them to the inherited main/parent session; do not use parent: \"current\" unless the result is intentionally private to this ephemeral handler.",
     "- Keep any parent escalation brief and include the handler id.",
     ...parentNotificationModeLines(run).map((line) => `- ${line}`),
     "",
@@ -288,16 +289,17 @@ export function buildIntercomForkHandlerSystemPrompt(run: IntercomForkHandlerRun
   return [
     "You are a background pi-intercom handler in a sibling Pi process.",
     "Your only task is to handle the inbound intercom event capsule supplied in the latest user message.",
-    "Do not continue unrelated inherited parent work. Treat inherited conversation as context only.",
+    "You run in a forked parent snapshot; use it as context only and do not continue unrelated parent work.",
     "You have delegated authority to answer or act when safe and derivable.",
     "Escalate only for destructive actions, ambiguous user preference, external side effects, security/privacy/cost risk, conflict with parent work, or low confidence.",
     "For intercom asks, answer directly with intercom.send + replyTo when safe; otherwise escalate quickly.",
+    "If you create return_on watchers or subagents whose result the parent needs, route them to the inherited main/parent session; do not use parent: \"current\" unless the result is intentionally private to this ephemeral handler.",
     ...parentNotificationModeLines(run),
     `Handler id: ${run.id}`,
   ].join("\n");
 }
 
-function buildHandlerArgs(run: IntercomForkHandlerRun): string[] {
+export function buildHandlerArgs(run: IntercomForkHandlerRun): string[] {
   return buildPiForkArgs({
     sessionDir: run.sessionDir,
     systemPrompt: buildIntercomForkHandlerSystemPrompt(run),
@@ -385,10 +387,38 @@ function formatSummary(run: IntercomForkHandlerRun): string {
   ].join("\n");
 }
 
+export function fallbackSummaryForEmptyHandler(run: Pick<IntercomForkHandlerRun, "from">, bodyText: string | undefined): string {
+  const trimmed = bodyText?.trim();
+  if (!trimmed) return "Handler exited without a final response. No handler output was captured.";
+  return truncateText([
+    "Handler exited without a final response; showing the original intercom message instead.",
+    `From: ${run.from}`,
+    "",
+    trimmed,
+  ].join("\n"), HANDLER_SUMMARY_LIMIT_BYTES);
+}
+
+async function readOriginalBodyText(run: IntercomForkHandlerRun): Promise<string | undefined> {
+  try {
+    const raw = await fsp.readFile(run.eventPath, "utf8");
+    const parsed = JSON.parse(raw) as { payload?: { bodyText?: unknown; content?: { text?: unknown } } };
+    return typeof parsed.payload?.bodyText === "string"
+      ? parsed.payload.bodyText
+      : typeof parsed.payload?.content?.text === "string"
+        ? parsed.payload.content.text
+        : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function fillHandlerOutput(run: IntercomForkHandlerRun): Promise<{ stdout: string; stderr: string }> {
   const stdout = await readOptionalText(run.stdoutPath);
   const stderr = await readOptionalText(run.stderrPath);
-  run.summary = truncateText(stdout.trim() || stderr.trim(), HANDLER_SUMMARY_LIMIT_BYTES);
+  const rawSummary = stdout.trim() || stderr.trim();
+  run.summary = rawSummary
+    ? truncateText(rawSummary, HANDLER_SUMMARY_LIMIT_BYTES)
+    : fallbackSummaryForEmptyHandler(run, await readOriginalBodyText(run));
   return { stdout, stderr };
 }
 
@@ -490,17 +520,6 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
     await fsp.writeFile(run.inboundBodyPath, entry.bodyText, "utf8");
   }
   const eventJson = JSON.stringify(buildIntercomForkEventPayload(entry, run, ctx, pi), null, 2);
-  if (run.parentSessionFile) {
-    const snapshotPath = parentSessionSnapshotPath(run);
-    try {
-      await fsp.copyFile(run.parentSessionFile, snapshotPath);
-      run.forkSessionFile = snapshotPath;
-      const snapshotBytes = fileSizeBytes(snapshotPath);
-      if (snapshotBytes !== null) run.parentSessionSnapshotBytes = snapshotBytes;
-    } catch {
-      // Best effort. If snapshotting fails, fall back to the original session file.
-    }
-  }
   await fsp.writeFile(run.eventPath, `${eventJson}\n`, "utf8");
   await fsp.writeFile(run.promptPath, buildIntercomForkHandlerPrompt(entry, run, eventJson), "utf8");
   handlerRuns.push(run);
