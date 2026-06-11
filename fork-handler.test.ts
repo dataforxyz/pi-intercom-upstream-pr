@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildHandlerArgs, buildIntercomForkEventPayload, buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, cleanupParentSessionSnapshot, fallbackSummaryForEmptyHandler, resolveTriggerParentOnSummary, shouldAutoTriggerParent, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
+import { buildHandlerArgs, buildIntercomForkEventPayload, buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, cleanupParentSessionSnapshot, fallbackSummaryForEmptyHandler, resolveTriggerParentOnSummary, shouldAutoTriggerParent, shouldLaunchInboundForkHandler, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
 
 function makeRun(): IntercomForkHandlerRun {
   return {
@@ -58,6 +58,7 @@ test("send fork handler prompt treats non-blocking messages as async summaries",
   const prompt = buildIntercomForkHandlerPrompt(makeEntry(false), makeRun(), JSON.stringify({ type: "intercom.message" }, null, 2));
   assert.match(prompt, /non-blocking intercom send/i);
   assert.match(prompt, /summarize only what matters/i);
+  assert.match(prompt, /Do not reply just to acknowledge/i);
   assert.match(prompt, /do not use parent: "current"/i);
 });
 
@@ -87,6 +88,15 @@ test("auto parent trigger wakes for subagent results but not routine progress", 
   progress.bodyText = "Subagent progress update. Reviewing PR now.";
   progress.message.content.text = progress.bodyText;
   assert.equal(shouldAutoTriggerParent(progress), false);
+  assert.equal(shouldLaunchInboundForkHandler(progress), false);
+
+  const ask = makeEntry(true);
+  assert.equal(shouldLaunchInboundForkHandler(ask), true);
+
+  const actionable = makeEntry(false);
+  actionable.bodyText = "Subagent needs attention before continuing.";
+  actionable.message.content.text = actionable.bodyText;
+  assert.equal(shouldLaunchInboundForkHandler(actionable), true);
 
   const result = makeEntry(false);
   result.from.id = "subagent-result";
@@ -94,6 +104,7 @@ test("auto parent trigger wakes for subagent results but not routine progress", 
   result.bodyText = "subagent results\n\nStatus: completed";
   result.message.content.text = result.bodyText;
   assert.equal(shouldAutoTriggerParent(result), true);
+  assert.equal(shouldLaunchInboundForkHandler(result), true);
 
   const run = { ...makeRun(), triggerParentOnSummary: "auto" as const, autoTriggerParentOnSummary: true };
   assert.equal(resolveTriggerParentOnSummary(run), true);

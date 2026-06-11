@@ -654,6 +654,51 @@ test("fork-routed inbound asks are not also listed as parent pending asks", { co
   }
 }));
 
+test("busy routine progress updates queue instead of launching fork handlers", { concurrency: false }, async () => withIntercomConfig({
+  inboundForkHandlers: {
+    enabled: true,
+    when: "busy",
+    notify: "none",
+    piCommand: "/bin/true",
+    triggerParentOnSummary: false,
+  },
+}, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let idle = false;
+  const harness = createExtensionHarness("busy-progress-parent", {
+    hasUI: true,
+    isIdle: () => idle,
+  });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const target = await waitForSessionByName(planner, "busy-progress-parent");
+    const delivered = await planner.send(target.id, {
+      messageId: "progress-update-1",
+      text: "Subagent progress update. Starting report #4 and creating a dedicated worktree.",
+    });
+    assert.equal(delivered.delivered, true);
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(harness.entries.some((entry) => entry.type === "intercom_fork_handler_started"), false);
+    assert.equal(harness.sentMessages.length, 0);
+
+    idle = true;
+    await harness.emitLifecycle("agent_end");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(harness.sentMessages.length, 1);
+    assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /Starting report #4/);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+}));
+
 test("supervisor tool registers only when child metadata is present", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
 

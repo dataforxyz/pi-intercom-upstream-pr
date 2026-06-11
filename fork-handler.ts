@@ -16,7 +16,7 @@ const INTERCOM_PARENT_SESSION_ID_ENV = "PI_INTERCOM_PARENT_SESSION_ID";
 const INTERCOM_PARENT_SESSION_NAME_ENV = "PI_INTERCOM_PARENT_SESSION_NAME";
 const INTERCOM_PARENT_INTERCOM_TARGET_ENV = "PI_INTERCOM_PARENT_INTERCOM_TARGET";
 
-export type InboundForkWhen = "busy" | "always";
+export type InboundForkWhen = "auto" | "busy" | "always";
 export type InboundForkNotify = "ack-and-summary" | "summary" | "none";
 export type InboundForkTriggerParent = boolean | "auto";
 
@@ -159,13 +159,20 @@ function explicitParentTrigger(text: string): boolean | undefined {
   return undefined;
 }
 
+const ACTIONABLE_PARENT_UPDATE_PATTERN = /\b(?:needs? (?:attention|decision|help)|blocked|review[- ]?complete|status:\s*completed)\b/i;
+
+export function shouldLaunchInboundForkHandler(entry: InboundForkMessageEntry): boolean {
+  if (entry.message.expectsReply === true) return true;
+  if (isSubagentResultEntry(entry)) return true;
+  if (explicitParentTrigger(entry.bodyText) === true) return true;
+  if (ACTIONABLE_PARENT_UPDATE_PATTERN.test(entry.bodyText)) return true;
+  return false;
+}
+
 export function shouldAutoTriggerParent(entry: InboundForkMessageEntry): boolean {
   const explicit = explicitParentTrigger(entry.bodyText);
   if (explicit !== undefined) return explicit;
-  if (entry.message.expectsReply === true) return true;
-  if (isSubagentResultEntry(entry)) return true;
-  if (/\b(?:needs? (?:attention|decision|help)|blocked|review[- ]?complete|status:\s*completed)\b/i.test(entry.bodyText)) return true;
-  return false;
+  return shouldLaunchInboundForkHandler(entry);
 }
 
 export function resolveTriggerParentOnSummary(run: IntercomForkHandlerRun): boolean {
@@ -254,7 +261,8 @@ export function buildIntercomForkHandlerPrompt(entry: InboundForkMessageEntry, r
     ]
     : [
       "This is a non-blocking intercom send. Handle it asynchronously and summarize only what matters.",
-      `If useful, respond with intercom({ action: "send", to: ${JSON.stringify(senderTarget)}, message: "..." }).`,
+      "Do not reply just to acknowledge receipt, startup, or routine progress.",
+      `Only respond with intercom({ action: "send", to: ${JSON.stringify(senderTarget)}, message: "..." }) if you can correct course, provide requested data, or unblock something.`,
     ];
   return [
     "You are a background pi-intercom handler running in a sibling Pi session.",

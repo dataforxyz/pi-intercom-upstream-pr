@@ -12,7 +12,7 @@ import { loadConfig, type IntercomConfig } from "./config.ts";
 import { buildIntercomStatus, getForkHandlerIdentity, isForkHandlerSession } from "./fork-routing.ts";
 import type { SessionInfo, Message, Attachment } from "./types.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
-import { launchIntercomForkHandler, listIntercomForkHandlers } from "./fork-handler.ts";
+import { launchIntercomForkHandler, listIntercomForkHandlers, shouldLaunchInboundForkHandler } from "./fork-handler.ts";
 import { compactIntercomHandlerMessages } from "./context-compaction.ts";
 
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
@@ -744,6 +744,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   async function maybeLaunchInboundForkHandler(ctx: ExtensionContext, entry: InboundMessageEntry, parentIsBusy: boolean, parentHasPendingMessages = false): Promise<boolean> {
     if (process.env.PI_INTERCOM_FORK_HANDLER === "1") return false;
     if (!config.inboundForkHandlers.enabled) return false;
+    if (config.inboundForkHandlers.when !== "always" && !shouldLaunchInboundForkHandler(entry)) return false;
     if (config.inboundForkHandlers.when === "busy" && !parentIsBusy) return false;
     if (config.inboundForkHandlers.when === "auto" && !parentIsBusy && !parentHasPendingMessages) return false;
     try {
@@ -804,7 +805,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         if (!activeContext.hasUI) {
           const activeClient = client;
-          if (!message.replyTo && activeClient?.isConnected()) {
+          if (message.expectsReply === true && !message.replyTo && activeClient?.isConnected()) {
             try {
               const result = await activeClient.send(from.id, {
                 text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
