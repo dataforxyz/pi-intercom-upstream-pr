@@ -10,6 +10,7 @@
     "config.ts",
     "fork-handler.ts",
     "fork-routing.ts",
+    "background-lineage.ts",
     "context-compaction.ts",
     "fork-runtime.ts",
     "fork-runtime-fallback.ts",
@@ -19,7 +20,7 @@
     "skills/**/*"
   ],
   "scripts": {
-    "test": "tsx --test broker/paths.test.ts broker/spawn.test.ts clipboard.test.ts config.test.ts context-compaction.test.ts fork-handler.test.ts fork-routing.test.ts reply-tracker.test.ts intercom.integration.test.ts test/inline-message.test.ts"
+    "test": "tsx --test background-lineage.test.ts broker/paths.test.ts broker/spawn.test.ts clipboard.test.ts config.test.ts context-compaction.test.ts fork-handler.test.ts fork-routing.test.ts fork-runtime-state.test.ts reply-tracker.test.ts intercom.integration.test.ts test/inline-message.test.ts"
   },
   "keywords": [
     "pi-package"

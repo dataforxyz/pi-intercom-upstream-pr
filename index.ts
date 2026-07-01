@@ -12,8 +12,9 @@ import { loadConfig, type IntercomConfig } from "./config.ts";
 import { buildIntercomStatus, getForkHandlerIdentity, isForkHandlerSession } from "./fork-routing.ts";
 import type { SessionInfo, Message, Attachment } from "./types.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
-import { launchIntercomForkHandler, listIntercomForkHandlers, shouldLaunchInboundForkHandler } from "./fork-handler.ts";
+import { backgroundForkDepthExceeded, drainIntercomBackgroundQueue, launchIntercomForkHandler, listIntercomForkHandlers, maxBackgroundForkDepth, shouldLaunchInboundForkHandler } from "./fork-handler.ts";
 import { compactIntercomHandlerMessages } from "./context-compaction.ts";
+import { backgroundLineageFromEnv, chargeBackgroundLineageAutoFork, resolveInboundBackgroundLineage, storeBackgroundLineageSidecar, withLineageDebugTag, type BackgroundLineage } from "./background-lineage.ts";
 
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
@@ -26,6 +27,33 @@ const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
 const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
+const BACKGROUND_EVENTS_MODULE = "pi-forks/background-events";
+
+type BackgroundRouterDecision = "fork" | "wake_main" | "display" | "queue";
+type BackgroundEventsModule = {
+  BackgroundEventsStore: new (...args: never[]) => {
+    chargeAutoForkForLineage?: (input: Record<string, unknown>) => { allowed: boolean; reason?: string };
+    upsertLineageBudget: (input: Record<string, unknown>) => void;
+    canAutoFork: (input: { forkDepth?: number; maxForkDepth?: number; lineageId?: string; forkable?: boolean }) => { allowed: boolean; reason?: string };
+    chargeLineageFollowup: (input: { lineageId: string; forkable?: boolean; now?: number }) => { allowed: boolean; reason?: string };
+    close: () => void;
+  };
+  runOptionalRouterDecision?: (input: {
+    config?: Record<string, unknown>;
+    fallback: BackgroundRouterDecision;
+    railsAllowed?: BackgroundRouterDecision[];
+    ambiguous?: boolean;
+    decide?: (input: { fallback: BackgroundRouterDecision; railsAllowed?: BackgroundRouterDecision[] }) => unknown;
+  }) => Promise<{ decision: BackgroundRouterDecision; reason: string }>;
+};
+let backgroundEventsImport: Promise<BackgroundEventsModule | undefined> | undefined;
+
+async function loadBackgroundEventsModule(): Promise<BackgroundEventsModule | undefined> {
+  backgroundEventsImport ??= import(BACKGROUND_EVENTS_MODULE)
+    .then((module) => module as BackgroundEventsModule)
+    .catch(() => undefined);
+  return backgroundEventsImport;
+}
 
 interface ChildOrchestratorMetadata {
   orchestratorTarget: string;
@@ -40,6 +68,7 @@ interface InboundMessageEntry {
   message: Message;
   replyCommand?: string;
   bodyText: string;
+  backgroundLineage?: BackgroundLineage;
 }
 
 type ContactSupervisorReason = "need_decision" | "progress_update" | "interview_request";
@@ -674,8 +703,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       return;
     }
-    const context = replyTracker.recordIncomingMessage(entry.from, entry.message, Date.now());
-    if (delivery !== "followUp") {
+    const context = replyTracker.recordIncomingMessage(entry.from, entry.message, Date.now(), entry.backgroundLineage);
+    if (delivery !== "followUp" || entry.backgroundLineage) {
       replyTracker.queueTurnContext(context);
     }
     const senderDisplay = entry.from.name || entry.from.id.slice(0, 8);
@@ -733,12 +762,51 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     pendingIdleMessages.push(entry);
     scheduleInboundFlush();
   }
+  async function chargeInboundForkLineage(entry: InboundMessageEntry): Promise<{ allowed: boolean; reason?: string }> {
+    if (!entry.backgroundLineage) return { allowed: true };
+    const module = await loadBackgroundEventsModule();
+    if (!module) return { allowed: true };
+    const store = new module.BackgroundEventsStore();
+    try {
+      return chargeBackgroundLineageAutoFork(entry.backgroundLineage, store, { maxForkDepth: maxBackgroundForkDepth() });
+    } finally {
+      store.close();
+    }
+  }
+  async function routeInboundForkWithOptionalRouter(entry: InboundMessageEntry, parentIsBusy: boolean, parentHasPendingMessages: boolean): Promise<{ decision: BackgroundRouterDecision; reason: string }> {
+    const module = await loadBackgroundEventsModule();
+    const advisoryDecision = process.env.PI_BACKGROUND_ROUTER_DECISION?.trim();
+    if (!module?.runOptionalRouterDecision || !advisoryDecision) return { decision: "fork", reason: "disabled" };
+    return module.runOptionalRouterDecision({
+      fallback: "fork",
+      railsAllowed: ["fork", "wake_main", "display"],
+      ambiguous: config.inboundForkHandlers.when === "auto" && (parentIsBusy || parentHasPendingMessages),
+      decide: () => advisoryDecision,
+    });
+  }
   async function maybeLaunchInboundForkHandler(ctx: ExtensionContext, entry: InboundMessageEntry, parentIsBusy: boolean, parentHasPendingMessages = false): Promise<boolean> {
     if (process.env.PI_INTERCOM_FORK_HANDLER === "1") return false;
+    if (backgroundForkDepthExceeded()) return false;
     if (!config.inboundForkHandlers.enabled) return false;
     if (config.inboundForkHandlers.when !== "always" && !shouldLaunchInboundForkHandler(entry)) return false;
     if (config.inboundForkHandlers.when === "busy" && !parentIsBusy) return false;
     if (config.inboundForkHandlers.when === "auto" && !parentIsBusy && !parentHasPendingMessages) return false;
+    const lineageGate = await chargeInboundForkLineage(entry).catch((error) => {
+      console.error("[pi-intercom] Failed to charge inbound fork lineage", error);
+      return { allowed: false, reason: "lineage-charge-failed" };
+    });
+    if (!lineageGate.allowed) {
+      pi.appendEntry("intercom_fork_handler_blocked", { messageId: entry.message.id, reason: lineageGate.reason ?? "lineage-budget", timestamp: Date.now() });
+      return false;
+    }
+    const routerDecision = await routeInboundForkWithOptionalRouter(entry, parentIsBusy, parentHasPendingMessages).catch((error) => {
+      console.error("[pi-intercom] Failed to run inbound fork router", error);
+      return { decision: "fork" as const, reason: "router-error" };
+    });
+    if (routerDecision.decision !== "fork") {
+      pi.appendEntry("intercom_fork_handler_blocked", { messageId: entry.message.id, reason: `router-${routerDecision.decision}:${routerDecision.reason}`, timestamp: Date.now() });
+      return false;
+    }
     try {
       const launched = await launchIntercomForkHandler(pi, ctx, entry, config.inboundForkHandlers);
       if (launched) {
@@ -785,14 +853,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       if (!activeContext) {
         return;
       }
+      const backgroundLineage = await resolveInboundBackgroundLineage(message.id, message.content.text).catch((error) => {
+        console.error("[pi-intercom] Failed to resolve inbound background lineage", error);
+        return undefined;
+      });
+      const routedEntry: InboundMessageEntry = backgroundLineage ? { ...entry, backgroundLineage } : entry;
       const parentIsBusy = !activeContext.isIdle();
       const parentHasPendingMessages = typeof activeContext.hasPendingMessages === "function" && activeContext.hasPendingMessages();
       if (parentIsBusy) {
         if (fromForkHandler) {
-          sendIncomingMessage(entry, "trigger", messageGeneration);
+          sendIncomingMessage(routedEntry, "trigger", messageGeneration);
           return;
         }
-        if (await maybeLaunchInboundForkHandler(activeContext, entry, true, parentHasPendingMessages)) {
+        if (await maybeLaunchInboundForkHandler(activeContext, routedEntry, true, parentHasPendingMessages)) {
           return;
         }
         if (!activeContext.hasUI) {
@@ -812,14 +885,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           }
           return;
         }
-        queueIdleMessage(entry);
+        queueIdleMessage(routedEntry);
         return;
       }
       if (getLiveContext(liveContext, messageGeneration)) {
-        if (!fromForkHandler && await maybeLaunchInboundForkHandler(activeContext, entry, false, parentHasPendingMessages)) {
+        if (!fromForkHandler && await maybeLaunchInboundForkHandler(activeContext, routedEntry, false, parentHasPendingMessages)) {
           return;
         }
-        sendIncomingMessage(entry, "trigger", messageGeneration);
+        sendIncomingMessage(routedEntry, "trigger", messageGeneration);
       }
     })();
   }
@@ -1093,6 +1166,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     agentRunning = false;
     activeTools.clear();
     const startupGeneration = runtimeGeneration;
+    void drainIntercomBackgroundQueue(pi, ctx, config.inboundForkHandlers).catch((error) => {
+      console.error("[pi-intercom] Failed to drain background event queue", error);
+    });
     startupConnectTimer = setTimeout(() => {
       startupConnectTimer = null;
       if (!getLiveContext(ctx, startupGeneration)) {
@@ -1128,7 +1204,31 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     currentSessionId = null;
     sessionStartedAt = null;
   });
+  let activeTurnLineageEnv: Record<string, string | undefined> | null = null;
+  function clearActiveTurnLineageEnv(): void {
+    if (!activeTurnLineageEnv) return;
+    for (const [key, value] of Object.entries(activeTurnLineageEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    activeTurnLineageEnv = null;
+  }
+  function applyTurnLineageEnv(lineage: BackgroundLineage | undefined): void {
+    clearActiveTurnLineageEnv();
+    if (!lineage?.lineageId) return;
+    activeTurnLineageEnv = {
+      PI_BACKGROUND_LINEAGE_ID: process.env.PI_BACKGROUND_LINEAGE_ID,
+      PI_BACKGROUND_EVENT_ID: process.env.PI_BACKGROUND_EVENT_ID,
+      PI_BACKGROUND_WORK_KEY: process.env.PI_BACKGROUND_WORK_KEY,
+      PI_BACKGROUND_HANDLER_ID: process.env.PI_BACKGROUND_HANDLER_ID,
+    };
+    process.env.PI_BACKGROUND_LINEAGE_ID = lineage.lineageId;
+    if (lineage.rootEventId) process.env.PI_BACKGROUND_EVENT_ID = lineage.rootEventId;
+    if (lineage.rootWorkKey) process.env.PI_BACKGROUND_WORK_KEY = lineage.rootWorkKey;
+    if (lineage.originHandlerId) process.env.PI_BACKGROUND_HANDLER_ID = lineage.originHandlerId;
+  }
   pi.on("turn_end", () => {
+    clearActiveTurnLineageEnv();
     if (!getLiveContext()) {
       return;
     }
@@ -1173,6 +1273,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     currentSessionId = ctx.sessionManager.getSessionId();
     syncPresenceIdentity(ctx.sessionManager.getSessionId());
     replyTracker.beginTurn();
+    applyTurnLineageEnv(replyTracker.getCurrentTurnContext()?.backgroundLineage as BackgroundLineage | undefined);
   });
   pi.on("model_select", (event, ctx) => {
     if (!getLiveContext(ctx)) {
@@ -1592,8 +1693,10 @@ Usage:
                 };
               }
             }
+            const backgroundLineage = backgroundLineageFromEnv();
+            const outboundMessage = withLineageDebugTag(message, backgroundLineage);
             const result = await connectedClient.send(sendTo, {
-              text: message,
+              text: outboundMessage,
               attachments,
               replyTo,
             });
@@ -1605,9 +1708,12 @@ Usage:
                 details: { messageId: result.id, delivered: false, reason: result.reason },
               };
             }
+            await storeBackgroundLineageSidecar(result.id, backgroundLineage).catch((error) => {
+              console.error("[pi-intercom] Failed to store background lineage sidecar", error);
+            });
             pi.appendEntry("intercom_sent", {
               to,
-              message: { text: message, attachments, replyTo },
+              message: { text: outboundMessage, attachments, replyTo, ...(backgroundLineage ? { backgroundLineage } : {}) },
               messageId: result.id,
               timestamp: Date.now(),
             });
@@ -1672,9 +1778,11 @@ Usage:
             }
             const questionId = randomUUID();
             replyPromise = waitForReply(sendTo, questionId, _signal);
+            const backgroundLineage = backgroundLineageFromEnv();
+            const outboundMessage = withLineageDebugTag(message, backgroundLineage);
             const sendResult = await connectedClient.send(sendTo, {
               messageId: questionId,
-              text: message,
+              text: outboundMessage,
               attachments,
               replyTo,
               expectsReply: true,
@@ -1696,9 +1804,12 @@ Usage:
                 details: { error: true },
               };
             }
+            await storeBackgroundLineageSidecar(sendResult.id, backgroundLineage).catch((error) => {
+              console.error("[pi-intercom] Failed to store background lineage sidecar", error);
+            });
             pi.appendEntry("intercom_sent", {
               to,
-              message: { text: message, attachments, replyTo },
+              message: { text: outboundMessage, attachments, replyTo, ...(backgroundLineage ? { backgroundLineage } : {}) },
               messageId: sendResult.id,
               timestamp: Date.now(),
             });
@@ -1752,8 +1863,10 @@ Usage:
                 details: { error: true },
               };
             }
+            const backgroundLineage = backgroundLineageFromEnv();
+            const outboundMessage = withLineageDebugTag(message, backgroundLineage);
             const result = await connectedClient.send(target.from.id, {
-              text: message,
+              text: outboundMessage,
               replyTo: target.message.id,
             });
             if (!result.delivered) {
@@ -1765,9 +1878,12 @@ Usage:
               };
             }
             replyTracker.markReplied(target.message.id);
+            await storeBackgroundLineageSidecar(result.id, backgroundLineage).catch((error) => {
+              console.error("[pi-intercom] Failed to store background lineage sidecar", error);
+            });
             pi.appendEntry("intercom_sent", {
               to: target.from.name || target.from.id,
-              message: { text: message, replyTo: target.message.id },
+              message: { text: outboundMessage, replyTo: target.message.id, ...(backgroundLineage ? { backgroundLineage } : {}) },
               messageId: result.id,
               timestamp: Date.now(),
             });

@@ -37,6 +37,29 @@ test("reply resolves from current triggered message context", () => {
   assert.equal(tracker.resolveReplyTarget({}, 1002).from.id, "planner-id");
 });
 
+test("current triggered context preserves background lineage for turn-scoped attribution", () => {
+  const tracker = new ReplyTracker();
+  const context = tracker.recordIncomingMessage(createSession("handler-id", "handler"), createMessage("msg-1", "followup", false), 1000, { lineageId: "lin-1", rootEventId: "return_on:root", forkDepth: 1 });
+  tracker.queueTurnContext(context);
+  tracker.beginTurn(1001);
+
+  assert.deepEqual(tracker.getCurrentTurnContext()?.backgroundLineage, { lineageId: "lin-1", rootEventId: "return_on:root", forkDepth: 1 });
+  tracker.endTurn();
+  assert.equal(tracker.getCurrentTurnContext(), null);
+});
+
+test("queued turn contexts preserve lineage in FIFO order", () => {
+  const tracker = new ReplyTracker();
+  tracker.queueTurnContext(tracker.recordIncomingMessage(createSession("plain", "plain"), createMessage("msg-plain", "plain", false), 1000));
+  tracker.queueTurnContext(tracker.recordIncomingMessage(createSession("handler", "handler"), createMessage("msg-lineage", "lineage", false), 1001, { lineageId: "lin-followup", forkDepth: 0 }));
+
+  tracker.beginTurn(1002);
+  assert.equal(tracker.getCurrentTurnContext()?.message.id, "msg-plain");
+  tracker.endTurn();
+  tracker.beginTurn(1003);
+  assert.deepEqual(tracker.getCurrentTurnContext()?.backgroundLineage, { lineageId: "lin-followup", forkDepth: 0 });
+});
+
 test("reply resolves from single pending ask without current turn context", () => {
   const tracker = new ReplyTracker();
   tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-1", "Need a decision"), 1000);

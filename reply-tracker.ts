@@ -4,6 +4,13 @@ export interface IntercomContext {
   from: SessionInfo;
   message: Message;
   receivedAt: number;
+  backgroundLineage?: {
+    lineageId?: string;
+    rootEventId?: string;
+    rootWorkKey?: string;
+    originHandlerId?: string;
+    forkDepth?: number;
+  };
 }
 
 function matchesPendingSender(context: IntercomContext, to: string): boolean {
@@ -21,8 +28,8 @@ export class ReplyTracker {
 
   constructor(private readonly askTimeoutMs = 10 * 60 * 1000) {}
 
-  recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now()): IntercomContext {
-    const context = { from, message, receivedAt };
+  recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now(), backgroundLineage?: IntercomContext["backgroundLineage"]): IntercomContext {
+    const context = { from, message, receivedAt, ...(backgroundLineage ? { backgroundLineage } : {}) };
     if (message.expectsReply) {
       this.pendingAsks.set(message.id, context);
     }
@@ -40,6 +47,10 @@ export class ReplyTracker {
 
   endTurn(): void {
     this.currentTurnContext = null;
+  }
+
+  getCurrentTurnContext(): IntercomContext | null {
+    return this.currentTurnContext;
   }
 
   reset(): void {

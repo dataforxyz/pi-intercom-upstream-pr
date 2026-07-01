@@ -1,9 +1,10 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildForkHandlerEnv, buildForkRunPaths, buildPiForkArgs, getForkHandlersFile, launchDetachedFork, readOptionalText, truncateText, writeJsonAtomic } from "./fork-runtime.ts";
+import type { BackgroundLineage } from "./background-lineage.ts";
 import type { Message, SessionInfo } from "./types.ts";
 
 const HANDLER_MESSAGE_TYPE = "intercom_fork_handler";
@@ -15,6 +16,20 @@ const INTERCOM_PARENT_SESSION_FILE_ENV = "PI_INTERCOM_PARENT_SESSION_FILE";
 const INTERCOM_PARENT_SESSION_ID_ENV = "PI_INTERCOM_PARENT_SESSION_ID";
 const INTERCOM_PARENT_SESSION_NAME_ENV = "PI_INTERCOM_PARENT_SESSION_NAME";
 const INTERCOM_PARENT_INTERCOM_TARGET_ENV = "PI_INTERCOM_PARENT_INTERCOM_TARGET";
+
+export function currentBackgroundForkDepth(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.PI_BACKGROUND_FORK_DEPTH ?? "0");
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+export function maxBackgroundForkDepth(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.PI_BACKGROUND_MAX_FORK_DEPTH ?? "1");
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 1;
+}
+
+export function backgroundForkDepthExceeded(env: NodeJS.ProcessEnv = process.env): boolean {
+  return currentBackgroundForkDepth(env) >= maxBackgroundForkDepth(env);
+}
 
 export type InboundForkWhen = "auto" | "busy" | "always";
 export type InboundForkNotify = "ack-and-summary" | "summary" | "none";
@@ -33,6 +48,12 @@ export interface InboundForkMessageEntry {
   message: Message;
   replyCommand?: string;
   bodyText: string;
+  backgroundLineage?: BackgroundLineage;
+}
+
+export interface LaunchIntercomForkHandlerOptions {
+  handlerId?: string;
+  skipBackgroundRoute?: boolean;
 }
 
 export interface IntercomForkHandlerRun {
@@ -72,6 +93,20 @@ export interface IntercomForkHandlerRun {
   finishSource?: "close" | "reconciled";
 }
 
+type BackgroundEventsModule = {
+  BackgroundEventsStore: new (...args: never[]) => {
+    routeEvent: (envelope: Record<string, unknown>, options?: Record<string, unknown>) => { disposition: string; handlerId?: string; queueId?: string };
+    runReconcilerPass: (options: Record<string, unknown>) => { leaseAcquired: boolean; launchBundles?: Array<{ handlerId: string; source: string; events: Array<{ payloadPath: string }> }> };
+    markHandlerRunning: (handlerId: string, input?: Record<string, unknown>) => void;
+    failHandlerLaunch: (handlerId: string, options?: Record<string, unknown>) => unknown;
+    completeHandler: (handlerId: string, input?: Record<string, unknown>) => string | undefined;
+    close: () => void;
+  };
+  namespacedEventId: (source: "intercom", durableId: string) => string;
+};
+const BACKGROUND_EVENTS_MODULE = "pi-forks/background-events";
+let backgroundEventsImport: Promise<BackgroundEventsModule | undefined> | undefined;
+
 let handlerRuns: IntercomForkHandlerRun[] = [];
 
 async function loadHandlers(): Promise<void> {
@@ -109,6 +144,106 @@ function shortId(value: string): string {
 
 function makeHandlerId(message: Message): string {
   return `icfh_${Date.now().toString(36)}_${shortId(message.id)}_${randomBytes(2).toString("hex")}`;
+}
+
+export function intercomBackgroundEventId(messageId: string): string {
+  return messageId.startsWith("intercom:") ? messageId : `intercom:${messageId}`;
+}
+
+function intercomParentNamespace(run: Pick<IntercomForkHandlerRun, "parentSessionId" | "parentSessionFile" | "messageId">): string {
+  return run.parentSessionId ?? run.parentSessionFile ?? `intercom:${run.messageId}`;
+}
+
+function intercomWorkKey(run: Pick<IntercomForkHandlerRun, "parentSessionId" | "parentSessionFile" | "messageId">): string {
+  return `intercom:${intercomParentNamespace(run)}:message:${run.messageId}`;
+}
+
+async function loadBackgroundEventsModule(): Promise<BackgroundEventsModule | undefined> {
+  backgroundEventsImport ??= import(BACKGROUND_EVENTS_MODULE)
+    .then((module) => module as BackgroundEventsModule)
+    .catch(() => undefined);
+  return backgroundEventsImport;
+}
+
+async function fileSnapshot(filePath: string): Promise<{ sha256: string; bytes: number }> {
+  const data = await fsp.readFile(filePath);
+  return { sha256: createHash("sha256").update(data).digest("hex"), bytes: data.byteLength };
+}
+
+async function routeIntercomBackgroundEvent(entry: InboundForkMessageEntry, run: IntercomForkHandlerRun): Promise<{ disposition: string; handlerId?: string; queueId?: string } | undefined> {
+  const module = await loadBackgroundEventsModule();
+  if (!module) return undefined;
+  const snapshot = await fileSnapshot(run.eventPath);
+  const parentNamespace = intercomParentNamespace(run);
+  const eventId = module.namespacedEventId("intercom", run.messageId);
+  const workKey = intercomWorkKey(run);
+  const store = new module.BackgroundEventsStore();
+  try {
+    return store.routeEvent({
+      version: 1,
+      source: "intercom",
+      eventId,
+      workKey,
+      parentNamespace,
+      parent: {
+        sessionId: parentNamespace,
+        ...(run.parentSessionFile ? { sessionFile: run.parentSessionFile } : {}),
+        ...(run.parentSessionName ? { sessionName: run.parentSessionName } : {}),
+        ...(run.parentIntercomTarget ? { intercomTarget: run.parentIntercomTarget } : {}),
+        cwd: run.cwd,
+      },
+      createdAt: entry.message.timestamp ?? Date.now(),
+      priority: entry.message.expectsReply === true ? "high" : "normal",
+      payloadPath: run.eventPath,
+      payloadSha256: snapshot.sha256,
+      payloadBytes: snapshot.bytes,
+      expectedReply: entry.message.expectsReply === true,
+      needsDecision: entry.message.expectsReply === true,
+      eventType: entry.message.expectsReply === true ? "ask" : "message",
+      origin: {
+        forkDepth: entry.backgroundLineage?.forkDepth ?? currentBackgroundForkDepth(),
+        handlerId: entry.backgroundLineage?.originHandlerId ?? process.env.PI_BACKGROUND_HANDLER_ID,
+        rootEventId: entry.backgroundLineage?.rootEventId ?? process.env.PI_BACKGROUND_EVENT_ID,
+        rootWorkKey: entry.backgroundLineage?.rootWorkKey ?? process.env.PI_BACKGROUND_WORK_KEY,
+        lineageId: entry.backgroundLineage?.lineageId ?? process.env.PI_BACKGROUND_LINEAGE_ID,
+      },
+    }, { handlerId: run.id });
+  } finally {
+    store.close();
+  }
+}
+
+async function markBackgroundHandlerRunning(run: IntercomForkHandlerRun): Promise<void> {
+  const module = await loadBackgroundEventsModule();
+  if (!module) return;
+  const store = new module.BackgroundEventsStore();
+  try {
+    store.markHandlerRunning(run.id, { pid: run.pid, supervisorPid: process.pid, processGroupId: run.pid });
+  } finally {
+    store.close();
+  }
+}
+
+async function failBackgroundHandlerLaunch(handlerId: string, error: unknown): Promise<void> {
+  const module = await loadBackgroundEventsModule();
+  if (!module) return;
+  const store = new module.BackgroundEventsStore();
+  try {
+    store.failHandlerLaunch(handlerId, { error: error instanceof Error ? error.message : String(error), requeue: true });
+  } finally {
+    store.close();
+  }
+}
+
+async function completeBackgroundHandler(run: IntercomForkHandlerRun): Promise<void> {
+  const module = await loadBackgroundEventsModule();
+  if (!module) return;
+  const store = new module.BackgroundEventsStore();
+  try {
+    store.completeHandler(run.id, { status: run.status === "complete" ? "complete" : "failed", summaryPath: run.stdoutPath });
+  } finally {
+    store.close();
+  }
 }
 
 function getSessionFile(ctx: ExtensionContext): string | undefined {
@@ -464,6 +599,9 @@ async function markHandlerFinished(pi: ExtensionAPI, runId: string, code: number
   const { stderr } = await fillHandlerOutput(run);
   run.status = code === 0 ? "complete" : "failed";
   if (code !== 0) run.error = stderr.trim() || `handler exited with ${code ?? signal ?? "unknown status"}`;
+  await completeBackgroundHandler(run).catch((error) => {
+    console.error("[pi-intercom] Failed to complete background event handler", error);
+  });
   await cleanupParentSessionSnapshot(run);
   await saveHandlers();
   try {
@@ -484,10 +622,10 @@ async function markHandlerFinished(pi: ExtensionAPI, runId: string, code: number
   }
 }
 
-export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: ExtensionContext, entry: InboundForkMessageEntry, config: InboundForkHandlersConfig): Promise<boolean> {
+export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: ExtensionContext, entry: InboundForkMessageEntry, config: InboundForkHandlersConfig, options: LaunchIntercomForkHandlerOptions = {}): Promise<boolean> {
   await reconcileIntercomForkHandlers(pi);
   await loadHandlers();
-  const id = makeHandlerId(entry.message);
+  const id = options.handlerId ?? makeHandlerId(entry.message);
   const paths = buildForkRunPaths("intercom", id);
   const parentSessionFile = getSessionFile(ctx);
   const parentSessionId = getSessionId(ctx);
@@ -495,7 +633,7 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
   const parentIntercomTarget = resolveParentIntercomTarget(pi, ctx);
   const run: IntercomForkHandlerRun = {
     ...paths,
-    eventId: `intercom_${entry.message.id}`,
+    eventId: intercomBackgroundEventId(entry.message.id),
     messageId: entry.message.id,
     from: entry.from.name || entry.from.id,
     status: "starting",
@@ -520,6 +658,18 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
   const eventJson = JSON.stringify(buildIntercomForkEventPayload(entry, run, ctx, pi), null, 2);
   await fsp.writeFile(run.eventPath, `${eventJson}\n`, "utf8");
   await fsp.writeFile(run.promptPath, buildIntercomForkHandlerPrompt(entry, run, eventJson), "utf8");
+  const routed = options.skipBackgroundRoute ? undefined : await routeIntercomBackgroundEvent(entry, run).catch((error) => {
+    console.error("[pi-intercom] Failed to route inbound fork event through background-events", error);
+    return undefined;
+  });
+  if (routed && routed.disposition !== "handler-starting") {
+    try {
+      pi.appendEntry?.("intercom_fork_handler_routed_without_launch", { id: run.id, routedHandlerId: routed.handlerId, queueId: routed.queueId, messageId: run.messageId, disposition: routed.disposition });
+    } catch {
+      // Best effort audit trail.
+    }
+    return true;
+  }
   handlerRuns.push(run);
   await saveHandlers();
 
@@ -534,8 +684,15 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
       stderrPath: run.stderrPath,
       env: buildForkHandlerEnv("intercom", run.id, {
         ...process.env,
-        ...(run.parentSessionFile ? { [INTERCOM_PARENT_SESSION_FILE_ENV]: run.parentSessionFile } : {}),
-        ...(run.parentSessionId ? { [INTERCOM_PARENT_SESSION_ID_ENV]: run.parentSessionId } : {}),
+        PI_BACKGROUND_FORK_DEPTH: String(currentBackgroundForkDepth() + 1),
+        PI_BACKGROUND_MAX_FORK_DEPTH: String(maxBackgroundForkDepth()),
+        PI_BACKGROUND_HANDLER_ID: run.id,
+        PI_BACKGROUND_EVENT_ID: run.eventId,
+        PI_BACKGROUND_WORK_KEY: intercomWorkKey(run),
+        PI_BACKGROUND_LINEAGE_ID: process.env.PI_BACKGROUND_LINEAGE_ID || intercomWorkKey(run),
+        ...(run.parentSessionFile ? { PI_BACKGROUND_PARENT_SESSION_FILE: run.parentSessionFile, [INTERCOM_PARENT_SESSION_FILE_ENV]: run.parentSessionFile } : {}),
+        ...(run.parentSessionId ? { PI_BACKGROUND_PARENT_SESSION_ID: run.parentSessionId, [INTERCOM_PARENT_SESSION_ID_ENV]: run.parentSessionId } : {}),
+        ...(run.parentIntercomTarget ? { PI_BACKGROUND_PARENT_INTERCOM_TARGET: run.parentIntercomTarget } : {}),
         ...(run.parentSessionName ? { [INTERCOM_PARENT_SESSION_NAME_ENV]: run.parentSessionName } : {}),
         ...(run.parentIntercomTarget ? { [INTERCOM_PARENT_INTERCOM_TARGET_ENV]: run.parentIntercomTarget } : {}),
       }),
@@ -551,6 +708,9 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
       failed.status = "failed";
       failed.endedAt = Date.now();
       failed.error = launch.error instanceof Error ? launch.error.message : String(launch.error);
+      await failBackgroundHandlerLaunch(run.id, launch.error).catch((error) => {
+        console.error("[pi-intercom] Failed to compensate background event launch failure", error);
+      });
       await cleanupParentSessionSnapshot(failed);
       if (!handlerRuns.some((candidate) => candidate.id === run.id)) handlerRuns.push(failed);
       await saveHandlers();
@@ -560,16 +720,61 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
 
     run.pid = launch.pid;
     run.status = "running";
+    await markBackgroundHandlerRunning(run).catch((error) => {
+      console.error("[pi-intercom] Failed to mark background event handler running", error);
+    });
     await saveHandlers();
     return true;
   } catch (error) {
     run.status = "failed";
     run.endedAt = Date.now();
     run.error = error instanceof Error ? error.message : String(error);
+    await failBackgroundHandlerLaunch(run.id, error).catch((compensateError) => {
+      console.error("[pi-intercom] Failed to compensate background event launch exception", compensateError);
+    });
     await cleanupParentSessionSnapshot(run);
     await saveHandlers();
     console.error("[pi-intercom] Failed to launch fork handler", error);
     return false;
+  }
+}
+
+function entryFromBackgroundPayload(payload: any): InboundForkMessageEntry | undefined {
+  const body = payload?.payload;
+  if (!body?.messageId || !body?.from) return undefined;
+  return {
+    from: body.from,
+    message: {
+      id: body.messageId,
+      timestamp: typeof body.timestamp === "number" ? body.timestamp : Date.now(),
+      ...(body.replyTo ? { replyTo: body.replyTo } : {}),
+      ...(body.expectsReply === true ? { expectsReply: true } : {}),
+      content: body.content ?? { text: body.bodyText ?? "" },
+    },
+    ...(body.expectsReply === true ? { replyCommand: `intercom({ action: "reply", message: "..." })` } : {}),
+    bodyText: body.bodyText ?? body.content?.text ?? "",
+  };
+}
+
+export async function drainIntercomBackgroundQueue(pi: ExtensionAPI, ctx: ExtensionContext, config: InboundForkHandlersConfig): Promise<number> {
+  const module = await loadBackgroundEventsModule();
+  if (!module) return 0;
+  const store = new module.BackgroundEventsStore();
+  try {
+    const pass = store.runReconcilerPass({ leaseName: "intercom", ownerId: `intercom:${process.pid}`, leaseTtlMs: 30_000, dequeueLimit: 4 });
+    let launched = 0;
+    for (const bundle of pass.launchBundles ?? []) {
+      if (bundle.source !== "intercom") continue;
+      const firstEvent = bundle.events[0];
+      if (!firstEvent) continue;
+      const payload = JSON.parse(await fsp.readFile(firstEvent.payloadPath, "utf8"));
+      const entry = entryFromBackgroundPayload(payload);
+      if (!entry) continue;
+      if (await launchIntercomForkHandler(pi, ctx, entry, config, { handlerId: bundle.handlerId, skipBackgroundRoute: true })) launched += 1;
+    }
+    return launched;
+  } finally {
+    store.close();
   }
 }
 

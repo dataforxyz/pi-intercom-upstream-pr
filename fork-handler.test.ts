@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildHandlerArgs, buildIntercomForkEventPayload, buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, cleanupParentSessionSnapshot, fallbackSummaryForEmptyHandler, resolveTriggerParentOnSummary, shouldAutoTriggerParent, shouldLaunchInboundForkHandler, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
+import { backgroundForkDepthExceeded, buildHandlerArgs, buildIntercomForkEventPayload, buildIntercomForkHandlerPrompt, buildIntercomForkHandlerSystemPrompt, cleanupParentSessionSnapshot, currentBackgroundForkDepth, fallbackSummaryForEmptyHandler, intercomBackgroundEventId, maxBackgroundForkDepth, resolveTriggerParentOnSummary, shouldAutoTriggerParent, shouldLaunchInboundForkHandler, type IntercomForkHandlerRun, type InboundForkMessageEntry } from "./fork-handler.ts";
 
 function makeRun(): IntercomForkHandlerRun {
   return {
@@ -45,6 +45,19 @@ function makeEntry(expectsReply: boolean): InboundForkMessageEntry {
     bodyText: expectsReply ? "Can I proceed?" : "FYI: build finished",
   };
 }
+
+test("intercom background event ids are source namespaced", () => {
+  assert.equal(intercomBackgroundEventId("msg-1"), "intercom:msg-1");
+  assert.equal(intercomBackgroundEventId("intercom:msg-1"), "intercom:msg-1");
+});
+
+test("background fork depth helpers block nested fork handlers by default", () => {
+  assert.equal(currentBackgroundForkDepth({ PI_BACKGROUND_FORK_DEPTH: "2" }), 2);
+  assert.equal(maxBackgroundForkDepth({ PI_BACKGROUND_MAX_FORK_DEPTH: "3" }), 3);
+  assert.equal(backgroundForkDepthExceeded({ PI_BACKGROUND_FORK_DEPTH: "1", PI_BACKGROUND_MAX_FORK_DEPTH: "1" }), true);
+  assert.equal(backgroundForkDepthExceeded({ PI_BACKGROUND_FORK_DEPTH: "0", PI_BACKGROUND_MAX_FORK_DEPTH: "1" }), false);
+  assert.equal(backgroundForkDepthExceeded({}), false);
+});
 
 test("ask fork handler prompt tells handler to answer with replyTo and delegated authority", () => {
   const prompt = buildIntercomForkHandlerPrompt(makeEntry(true), makeRun(), JSON.stringify({ type: "intercom.ask" }, null, 2));
