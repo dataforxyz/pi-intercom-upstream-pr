@@ -87,7 +87,6 @@ async function withChildOrchestratorEnv<T>(metadata: {
 
 interface CapturedToolResult {
   content: Array<{ type: string; text: string }>;
-  isError: boolean;
   details?: Record<string, unknown>;
 }
 
@@ -126,6 +125,7 @@ function createExtensionHarness(sessionName = "child-worker", options: {
   abort?: () => void;
   hasUI?: boolean;
   isIdle?: () => boolean;
+  mode?: "tui" | "rpc" | "json" | "print";
   ui?: unknown;
 } = {}) {
   const events = new EventEmitter();
@@ -163,6 +163,7 @@ function createExtensionHarness(sessionName = "child-worker", options: {
   };
   const ctx = {
     cwd: repoDir,
+    mode: options.mode ?? (options.hasUI ? "tui" : "print"),
     model: { id: "child-model" },
     sessionManager: { getSessionId: () => "session-child-test" },
     isIdle: options.isIdle ?? (() => true),
@@ -181,6 +182,13 @@ function createExtensionHarness(sessionName = "child-worker", options: {
       for (const handler of lifecycleHandlers.get(event) ?? []) {
         await handler(payload, eventContext);
       }
+    },
+    async emitLifecycleResults(event: string, payload: unknown = {}, eventContext: unknown = ctx) {
+      const results = [];
+      for (const handler of lifecycleHandlers.get(event) ?? []) {
+        results.push(await handler(payload, eventContext));
+      }
+      return results;
     },
   };
 }
@@ -316,6 +324,30 @@ test("intercom tool renders compact call and result rows", async () => {
   }, { isPartial: false, expanded: true }, renderTheme, { isError: false, expanded: true }));
   assert.match(errorText, /✗ Missing 'to' or 'message' parameter/);
   assert.match(errorText, /Reason: Missing target/);
+});
+
+test("intercom tool result hook marks failed details as errors", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness();
+  piIntercomExtension(harness.pi as never);
+
+  const errorResults = await harness.emitLifecycleResults("tool_result", {
+    toolName: "intercom",
+    details: { error: true },
+  });
+  assert.deepEqual(errorResults.filter(Boolean), [{ isError: true }]);
+
+  const deliveryResults = await harness.emitLifecycleResults("tool_result", {
+    toolName: "contact_supervisor",
+    details: { delivered: false },
+  });
+  assert.deepEqual(deliveryResults.filter(Boolean), [{ isError: true }]);
+
+  const okResults = await harness.emitLifecycleResults("tool_result", {
+    toolName: "intercom",
+    details: { delivered: true },
+  });
+  assert.deepEqual(okResults.filter(Boolean), []);
 });
 
 test("contact supervisor tool renders reason and reply state", async () => {
@@ -624,7 +656,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       const reply = await orchestrator.send(askFrom.id, { text: "Use the stable API.", replyTo: askMessage.id });
       assert.equal(reply.delivered, true);
       const askResult = await askResultPromise;
-      assert.equal(askResult.isError, false);
+      assert.notEqual(askResult.details?.error, true);
       assert.match(askResult.content[0]?.text ?? "", /Use the stable API/);
 
       const updateReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
@@ -635,7 +667,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       assert.match(updateMessage.content.text, /Run: 78f659a3/);
       assert.match(updateMessage.content.text, /Agent: worker/);
       assert.match(updateMessage.content.text, /Found a schema mismatch/);
-      assert.equal(updateResult.isError, false);
+      assert.notEqual(updateResult.details?.error, true);
 
       const interviewReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const interview = {
@@ -676,7 +708,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       });
       assert.equal(interviewReply.delivered, true);
       const interviewResult = await interviewResultPromise;
-      assert.equal(interviewResult.isError, false);
+      assert.notEqual(interviewResult.details?.error, true);
       assert.match(interviewResult.content[0]?.text ?? "", /Stable API/);
       assert.deepEqual(interviewResult.details?.structuredReply, structuredReply);
 
@@ -692,7 +724,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       });
       assert.equal(invalidReply.delivered, true);
       const invalidReplyResult = await invalidReplyResultPromise;
-      assert.equal(invalidReplyResult.isError, false);
+      assert.notEqual(invalidReplyResult.details?.error, true);
       assert.equal(invalidReplyResult.details?.structuredReply, undefined);
       assert.match(String(invalidReplyResult.details?.structuredReplyParseError), /must match one of the question options/);
 
@@ -716,15 +748,15 @@ test("child supervisor tool rejects invalid reasons and interview payloads", asy
     piIntercomExtension(harness.pi as never);
     const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
     const result = await supervisorTool.execute("invalid-1", { reason: "done", message: "Finished." }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(result.isError, true);
+    assert.equal(result.details?.error, true);
     assert.match(result.content[0]?.text ?? "", /Invalid reason/);
 
     const missingMessageResult = await supervisorTool.execute("invalid-message", { reason: "need_decision" }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(missingMessageResult.isError, true);
+    assert.equal(missingMessageResult.details?.error, true);
     assert.match(missingMessageResult.content[0]?.text ?? "", /Missing 'message'/);
 
     const invalidInterviewResult = await supervisorTool.execute("invalid-interview", { reason: "interview_request", interview: { title: "Bad" } }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(invalidInterviewResult.isError, true);
+    assert.equal(invalidInterviewResult.details?.error, true);
     assert.match(invalidInterviewResult.content[0]?.text ?? "", /interview\.questions must be a non-empty array/);
 
     const invalidInfoOptionsResult = await supervisorTool.execute("invalid-info-options", {
@@ -733,7 +765,7 @@ test("child supervisor tool rejects invalid reasons and interview payloads", asy
         questions: [{ id: "context", type: "info", question: "Context", options: ["Not an answer"] }],
       },
     }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(invalidInfoOptionsResult.isError, true);
+    assert.equal(invalidInfoOptionsResult.details?.error, true);
     assert.match(invalidInfoOptionsResult.content[0]?.text ?? "", /options is only valid for single and multi questions/);
   });
 });
@@ -754,16 +786,16 @@ test("child supervisor tool preserves delivery failure reasons", { concurrency: 
       await harness.emitLifecycle("session_start");
       const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
       const updateResult = await supervisorTool.execute("update-1", { reason: "progress_update", message: "Blocked." }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(updateResult.isError, true);
+      assert.equal(updateResult.details?.delivered, false);
       assert.match(updateResult.content[0]?.text ?? "", /Session not found/);
       assert.equal(updateResult.details?.reason, "Session not found");
 
       const askResult = await supervisorTool.execute("ask-1", { reason: "need_decision", message: "Which path?" }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(askResult.isError, true);
+      assert.equal(askResult.details?.error, true);
       assert.match(askResult.content[0]?.text ?? "", /Session not found/);
 
       const secondAskResult = await supervisorTool.execute("ask-2", { reason: "need_decision", message: "Still blocked." }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(secondAskResult.isError, true);
+      assert.equal(secondAskResult.details?.error, true);
       assert.match(secondAskResult.content[0]?.text ?? "", /Session not found/);
       assert.doesNotMatch(secondAskResult.content[0]?.text ?? "", /Already waiting/);
       await harness.emitLifecycle("session_shutdown");
@@ -796,7 +828,7 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       await cancelledMessage;
       controller.abort();
       const cancelledResult = await cancelledResultPromise;
-      assert.equal(cancelledResult.isError, true);
+      assert.equal(cancelledResult.details?.error, true);
       assert.match(cancelledResult.content[0]?.text ?? "", /Cancelled/);
 
       const nextMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
@@ -806,7 +838,7 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       const reply = await orchestrator.send(from.id, { text: "Yes.", replyTo: message.id });
       assert.equal(reply.delivered, true);
       const nextResult = await nextResultPromise;
-      assert.equal(nextResult.isError, false);
+      assert.notEqual(nextResult.details?.error, true);
       assert.match(nextResult.content[0]?.text ?? "", /Yes\./);
       await harness.emitLifecycle("session_shutdown");
     });

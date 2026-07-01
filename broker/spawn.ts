@@ -4,7 +4,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
 import net from "net";
-import { getBrokerSocketPath } from "./paths.js";
+import { getBrokerSocketPath } from "./paths.ts";
 
 const INTERCOM_DIR = join(homedir(), ".pi/agent/intercom");
 const EXTENSION_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");

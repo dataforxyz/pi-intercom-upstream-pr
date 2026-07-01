@@ -1,7 +1,8 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { IntercomClient } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
@@ -541,7 +542,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const identity = buildPresenceIdentity(pi, currentSessionId);
     return {
       name: identity.name,
-      cwd: liveContext.cwd ?? process.cwd(),
+      cwd: liveContext.cwd,
       model: currentModel,
       pid: process.pid,
       startedAt: sessionStartedAt,
@@ -797,12 +798,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     return byName[0]?.id ?? null;
   }
   function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): void {
+    const liveContext = getLiveContext();
     const now = Date.now();
     sendIncomingMessage({
       from: {
         id: sender,
         name: sender,
-        cwd: runtimeContext?.cwd ?? process.cwd(),
+        cwd: liveContext?.cwd ?? "",
         model: sender,
         pid: process.pid,
         startedAt: now,
@@ -892,14 +894,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
     })();
   }
-  pi.events.on(SUBAGENT_CONTROL_INTERCOM_EVENT, (payload) => {
+  const unsubscribeSubagentControlIntercom = pi.events.on(SUBAGENT_CONTROL_INTERCOM_EVENT, (payload) => {
     relaySubagentIntercomPayload(payload, {
       sender: "subagent-control",
       status: "needs_attention",
       errorEntryType: "intercom_control_error",
     });
   });
-  pi.events.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => {
+  const unsubscribeSubagentResultIntercom = pi.events.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => {
     relaySubagentIntercomPayload(payload, {
       sender: "subagent-result",
       status: "result",
@@ -941,6 +943,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   });
   
   pi.on("session_shutdown", async () => {
+    unsubscribeSubagentControlIntercom();
+    unsubscribeSubagentResultIntercom();
     shuttingDown = true;
     disposed = true;
     runtimeGeneration += 1;
@@ -1026,6 +1030,20 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText);
   });
 
+  pi.on("tool_result", (event) => {
+    if (event.toolName !== "intercom" && event.toolName !== "contact_supervisor") {
+      return;
+    }
+    if (!event.details || typeof event.details !== "object") {
+      return;
+    }
+
+    const details = event.details as { error?: unknown; delivered?: unknown };
+    if (details.error === true || details.delivered === false) {
+      return { isError: true };
+    }
+  });
+
   const childOrchestratorMetadata = readChildOrchestratorMetadata();
   if (childOrchestratorMetadata) {
     pi.registerTool({
@@ -1040,8 +1058,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         "Do not use contact_supervisor for routine completion handoffs; return the final subagent result normally.",
       ],
       parameters: Type.Object({
-        reason: Type.String({
-          enum: ["need_decision", "progress_update", "interview_request"],
+        reason: StringEnum(["need_decision", "progress_update", "interview_request"] as const, {
           description: "Contact reason: 'need_decision' waits for a reply; 'interview_request' sends structured questions and waits for a reply; 'progress_update' sends a non-blocking update",
         }),
         message: Type.Optional(Type.String({
@@ -1052,7 +1069,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           description: Type.Optional(Type.String()),
           questions: Type.Array(Type.Object({
             id: Type.String(),
-            type: Type.String({ description: "Question type: single, multi, text, image, or info" }),
+            type: StringEnum(["single", "multi", "text", "image", "info"] as const, {
+              description: "Question type: single, multi, text, image, or info",
+            }),
             question: Type.String(),
             options: Type.Optional(Type.Array(Type.Any())),
             context: Type.Optional(Type.String()),
@@ -1064,14 +1083,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (reason !== "need_decision" && reason !== "progress_update" && reason !== "interview_request") {
           return {
             content: [{ type: "text", text: "Invalid reason. Use 'need_decision', 'interview_request', or 'progress_update'." }],
-            isError: true,
             details: { error: true },
           };
         }
         if ((reason === "need_decision" || reason === "progress_update") && typeof params.message !== "string") {
           return {
             content: [{ type: "text", text: `Missing 'message' parameter for reason '${reason}'.` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1081,7 +1098,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (interviewValidation?.ok === false) {
           return {
             content: [{ type: "text", text: `Invalid interview request: ${interviewValidation.error}` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1093,7 +1109,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         } catch (error) {
           return {
             content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1103,7 +1118,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Cancelled" }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1115,21 +1129,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         } catch (error) {
           return {
             content: [{ type: "text", text: `Failed to resolve supervisor target: ${getErrorMessage(error)}` }],
-            isError: true,
             details: { error: true },
           };
         }
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Cancelled" }],
-            isError: true,
             details: { error: true },
           };
         }
         if (sendTo === connectedClient.sessionId) {
           return {
             content: [{ type: "text", text: "Cannot message the current session" }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1144,7 +1155,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
                 content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { messageId: result.id, delivered: false, reason: result.reason },
               };
             }
@@ -1157,13 +1167,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             });
             return {
               content: [{ type: "text", text: `Progress update sent to supervisor ${metadata.orchestratorTarget}` }],
-              isError: false,
               details: { messageId: result.id, delivered: true },
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to send progress update: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1172,7 +1180,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (replyWaiter) {
           return {
             content: [{ type: "text", text: "Already waiting for a reply" }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1191,7 +1198,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             }
             return {
               content: [{ type: "text", text: "Cancelled" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1215,7 +1221,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             }
             return {
               content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1245,10 +1250,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           });
           return {
             content: [{ type: "text", text: `**Reply from supervisor:**\n${replyText}${replyAttachments}` }],
-            isError: false,
-            ...(structuredReply
-              ? { details: structuredReply.value !== undefined ? { structuredReply: structuredReply.value } : { structuredReplyParseError: structuredReply.error } }
-              : {}),
+            details: structuredReply
+              ? structuredReply.value !== undefined
+                ? { structuredReply: structuredReply.value }
+                : { structuredReplyParseError: structuredReply.error }
+              : {},
           };
         } catch (error) {
           rejectReplyWaiter(toError(error));
@@ -1261,7 +1267,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           }
           return {
             content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-            isError: true,
             details: { error: true },
           };
         }
@@ -1299,7 +1304,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         return new Text(text, 0, 0);
       },
-    });
+    } as any);
   }
 
   pi.registerTool({
@@ -1319,7 +1324,7 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: Type.String({
+      action: StringEnum(["list", "send", "ask", "reply", "pending", "status"] as const, {
         description: "Action: 'list', 'send', 'ask', 'reply', 'pending', or 'status'",
       }),
       to: Type.Optional(Type.String({
@@ -1329,7 +1334,7 @@ Usage:
         description: "Message to send (for 'send', 'ask', or 'reply' action)",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
-        type: Type.Union([Type.Literal("file"), Type.Literal("snippet"), Type.Literal("context")]),
+        type: StringEnum(["file", "snippet", "context"] as const),
         name: Type.String(),
         content: Type.String(),
         language: Type.Optional(Type.String()),
@@ -1346,7 +1351,6 @@ Usage:
       } catch (error) {
         return {
           content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }],
-          isError: true,
           details: { error: true },
         };
       }
@@ -1366,7 +1370,6 @@ Usage:
             if (!currentSession) {
               return {
                 content: [{ type: "text", text: "Current session is missing from intercom session list." }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1378,12 +1381,11 @@ Usage:
 
             return {
               content: [{ type: "text", text: `${currentSection}\n\n${otherSection}` }],
-              isError: false,
+              details: {},
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to list sessions: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1393,7 +1395,6 @@ Usage:
           if (!to || !message) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'message' parameter" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1402,7 +1403,6 @@ Usage:
             if (sendTo === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1415,7 +1415,7 @@ Usage:
               if (!confirmed) {
                 return {
                   content: [{ type: "text", text: "Message cancelled by user" }],
-                  isError: false,
+                  details: {},
                 };
               }
             }
@@ -1428,7 +1428,6 @@ Usage:
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
                 content: [{ type: "text", text: `Message to "${to}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { messageId: result.id, delivered: false, reason: result.reason },
               };
             }
@@ -1443,13 +1442,11 @@ Usage:
             }
             return {
               content: [{ type: "text", text: `Message sent to ${to}` }],
-              isError: false,
               details: { messageId: result.id, delivered: true },
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to send: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1459,7 +1456,6 @@ Usage:
           if (!to || !message) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'message' parameter" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1467,7 +1463,6 @@ Usage:
           if (replyWaiter) {
             return {
               content: [{ type: "text", text: "Already waiting for a reply" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1475,7 +1470,6 @@ Usage:
           if (_signal?.aborted) {
             return {
               content: [{ type: "text", text: "Cancelled" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1486,14 +1480,12 @@ Usage:
             if (_signal?.aborted) {
               return {
                 content: [{ type: "text", text: "Cancelled" }],
-                isError: true,
                 details: { error: true },
               };
             }
             if (sendTo === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1519,7 +1511,6 @@ Usage:
               }
               return {
                 content: [{ type: "text", text: `Message to "${to}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1542,7 +1533,7 @@ Usage:
             });
             return {
               content: [{ type: "text", text: `**Reply from ${to}:**\n${replyText}${replyAttachments}` }],
-              isError: false,
+              details: {},
             };
           } catch (error) {
             rejectReplyWaiter(toError(error));
@@ -1555,7 +1546,6 @@ Usage:
             }
             return {
               content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1565,7 +1555,6 @@ Usage:
           if (!message) {
             return {
               content: [{ type: "text", text: "Missing 'message' parameter" }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1575,7 +1564,6 @@ Usage:
             if (target.from.id === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
-                isError: true,
                 details: { error: true },
               };
             }
@@ -1587,7 +1575,6 @@ Usage:
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
                 content: [{ type: "text", text: `Reply to "${target.from.name || target.from.id}" was not delivered: ${errorText}` }],
-                isError: true,
                 details: { messageId: result.id, delivered: false, reason: result.reason },
               };
             }
@@ -1600,13 +1587,11 @@ Usage:
             });
             return {
               content: [{ type: "text", text: `Reply sent to ${target.from.name || target.from.id}` }],
-              isError: false,
               details: { messageId: result.id, delivered: true, replyTo: target.message.id },
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to reply: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1617,7 +1602,7 @@ Usage:
           if (pendingAsks.length === 0) {
             return {
               content: [{ type: "text", text: "No unresolved inbound asks." }],
-              isError: false,
+              details: {},
             };
           }
 
@@ -1629,7 +1614,7 @@ Usage:
           });
           return {
             content: [{ type: "text", text: `**Pending asks:**\n${lines.join("\n")}` }],
-            isError: false,
+            details: {},
           };
         }
 
@@ -1642,12 +1627,11 @@ Usage:
                 type: "text",
                 text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nActive sessions: ${sessions.length}`,
               }],
-              isError: false,
+              details: {},
             };
           } catch (error) {
             return {
               content: [{ type: "text", text: `Failed to get status: ${getErrorMessage(error)}` }],
-              isError: true,
               details: { error: true },
             };
           }
@@ -1656,7 +1640,6 @@ Usage:
         default:
           return {
             content: [{ type: "text", text: `Unknown action: ${action}` }],
-            isError: true,
             details: { error: true },
           };
       }
@@ -1695,12 +1678,12 @@ Usage:
       }
       return new Text(text, 0, 0);
     },
-  });
+  } as any);
 
   async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
     const overlayGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, overlayGeneration);
-    if (!liveContext?.hasUI) return;
+    if (!liveContext?.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") return;
 
     let overlayClient: IntercomClient;
     try {

@@ -4,6 +4,13 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Changed
+- Updated Pi runtime peer metadata and tool schemas for the `@earendil-works` package scope and Pi-bundled `typebox`/`pi-ai` packages.
+
+### Fixed
+- Marked failed `intercom` and `contact_supervisor` tool results through Pi's `tool_result` error flag path while preserving structured renderer details.
+- Limited the intercom overlay to TUI mode and unsubscribed subagent relay event handlers during session shutdown.
+
 ## [0.6.0] - 2026-05-03
 
 ### Added

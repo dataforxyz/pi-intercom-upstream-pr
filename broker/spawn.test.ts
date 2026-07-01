@@ -10,7 +10,7 @@ import {
   getWindowsHiddenLauncherScript,
   getWindowsBrokerCommandLine,
   getWindowsHiddenLauncherPath,
-} from "./spawn.js";
+} from "./spawn.ts";
 
 test("getTsxCliPath points at local tsx cli", () => {
   const cliPath = getTsxCliPath("C:/repo");

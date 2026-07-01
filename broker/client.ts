@@ -1,9 +1,9 @@
 import { EventEmitter } from "events";
 import net from "net";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.js";
-import { getBrokerSocketPath } from "./paths.js";
-import type { SessionInfo, Message, Attachment } from "../types.js";
+import { writeMessage, createMessageReader } from "./framing.ts";
+import { getBrokerSocketPath } from "./paths.ts";
+import type { SessionInfo, Message, Attachment } from "../types.ts";
 
 const BROKER_SOCKET = getBrokerSocketPath();
 

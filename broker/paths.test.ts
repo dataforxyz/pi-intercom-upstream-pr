@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getBrokerSocketPath } from "./paths.js";
+import { getBrokerSocketPath } from "./paths.ts";
 
 test("getBrokerSocketPath uses named pipe on Windows", () => {
   const pipePath = getBrokerSocketPath("win32", "C:/Users/rcroh");

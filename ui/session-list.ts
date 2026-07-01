@@ -1,7 +1,7 @@
-import type { Component } from "@mariozechner/pi-tui";
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import type { KeybindingsManager, Theme } from "@mariozechner/pi-coding-agent";
-import type { SessionInfo } from "../types.js";
+import type { Component } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
+import type { SessionInfo } from "../types.ts";
 
 function middleTruncate(text: string, maxWidth: number): string {
   if (visibleWidth(text) <= maxWidth) {
