@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildForkHandlerEnv, buildForkRunPaths, buildPiForkArgs, getForkHandlersFile, launchDetachedFork, readOptionalText, truncateText, writeJsonAtomic } from "./fork-runtime.ts";
@@ -104,8 +106,17 @@ type BackgroundEventsModule = {
   };
   namespacedEventId: (source: "intercom", durableId: string) => string;
 };
-const BACKGROUND_EVENTS_MODULE = "pi-forks/background-events";
+const DEFAULT_BACKGROUND_EVENTS_MODULE = "pi-forks/background-events";
 let backgroundEventsImport: Promise<BackgroundEventsModule | undefined> | undefined;
+let backgroundEventsImportSpecifier: string | undefined;
+
+function installedPiForksBackgroundEventsModule(): string | undefined {
+  const agentDir = process.env.PI_CODING_AGENT_DIR?.trim()
+    ? path.resolve(process.env.PI_CODING_AGENT_DIR.trim())
+    : path.join(os.homedir(), ".pi", "agent");
+  const filePath = path.join(agentDir, "git", "github.com", "dataforxyz", "pi-forks", "src", "background-events.ts");
+  return fs.existsSync(filePath) ? pathToFileURL(filePath).href : undefined;
+}
 
 let handlerRuns: IntercomForkHandlerRun[] = [];
 
@@ -159,9 +170,20 @@ function intercomWorkKey(run: Pick<IntercomForkHandlerRun, "parentSessionId" | "
 }
 
 async function loadBackgroundEventsModule(): Promise<BackgroundEventsModule | undefined> {
-  backgroundEventsImport ??= import(BACKGROUND_EVENTS_MODULE)
-    .then((module) => module as BackgroundEventsModule)
-    .catch(() => undefined);
+  const specifier = process.env.PI_BACKGROUND_EVENTS_MODULE?.trim() || DEFAULT_BACKGROUND_EVENTS_MODULE;
+  const fallbacks = [specifier, installedPiForksBackgroundEventsModule()].filter(Boolean) as string[];
+  const cacheKey = fallbacks.join("\n");
+  if (!backgroundEventsImport || backgroundEventsImportSpecifier !== cacheKey) {
+    backgroundEventsImportSpecifier = cacheKey;
+    backgroundEventsImport = (async () => {
+      for (const candidate of fallbacks) {
+        try {
+          return await import(candidate) as BackgroundEventsModule;
+        } catch {}
+      }
+      return undefined;
+    })();
+  }
   return backgroundEventsImport;
 }
 
