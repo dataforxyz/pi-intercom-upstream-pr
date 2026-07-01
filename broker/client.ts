@@ -1,9 +1,9 @@
 import { EventEmitter } from "events";
 import net from "net";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.js";
-import { getBrokerSocketPath } from "./paths.js";
-import type { SessionInfo, Message, Attachment } from "../types.js";
+import { writeMessage, createMessageReader } from "./framing.ts";
+import { getBrokerSocketPath } from "./paths.ts";
+import type { SessionInfo, Message, Attachment } from "../types.ts";
 
 const BROKER_SOCKET = getBrokerSocketPath();
 
@@ -149,7 +149,7 @@ export class IntercomClient extends EventEmitter {
     return socket;
   }
 
-  connect(session: Omit<SessionInfo, "id">): Promise<void> {
+  connect(session: Omit<SessionInfo, "id">, sessionId?: string): Promise<void> {
     if (this.socket) {
       return Promise.reject(new Error("Already connected"));
     }
@@ -254,7 +254,7 @@ export class IntercomClient extends EventEmitter {
       this.once("_registered", onRegistered);
       
       try {
-        writeMessage(socket, { type: "register", session });
+        writeMessage(socket, { type: "register", session, ...(sessionId ? { sessionId } : {}) });
       } catch (error) {
         cleanupConnectionAttempt();
         cleanupSocketListeners();
@@ -518,6 +518,23 @@ export class IntercomClient extends EventEmitter {
         reject(toError(error));
       }
     });
+  }
+
+  cancelAsk(messageId: string): void {
+    if (this.disconnecting) {
+      return;
+    }
+
+    const socket = this.socket;
+    if (!socket || !this._sessionId || socket.destroyed || socket.writableEnded || !socket.writable) {
+      return;
+    }
+
+    try {
+      writeMessage(socket, { type: "cancel_ask", messageId });
+    } catch {
+      // Cancellation is best-effort; local waiter cleanup must still proceed.
+    }
   }
 
   updatePresence(updates: { name?: string; status?: string; model?: string }): void {

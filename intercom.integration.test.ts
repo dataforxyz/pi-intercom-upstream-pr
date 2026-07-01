@@ -11,6 +11,9 @@ import type { Message, SessionInfo } from "./types.ts";
 const repoDir = process.cwd();
 const childEnvKeys = [
   "PI_SUBAGENT_ORCHESTRATOR_TARGET",
+  "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID",
+  "PI_INTERCOM_SESSION_ID",
+  "PI_INTERCOM_NAME_POLL_MS",
   "PI_SUBAGENT_RUN_ID",
   "PI_SUBAGENT_CHILD_AGENT",
   "PI_SUBAGENT_CHILD_INDEX",
@@ -73,6 +76,9 @@ async function waitForBrokerReady(broker: ChildProcessWithoutNullStreams): Promi
 
 async function withChildOrchestratorEnv<T>(metadata: {
   orchestratorTarget?: string;
+  orchestratorSessionId?: string;
+  inheritedIntercomSessionId?: string;
+  namePollMs?: string;
   runId?: string;
   agent?: string;
   index?: string;
@@ -84,6 +90,9 @@ async function withChildOrchestratorEnv<T>(metadata: {
     delete process.env[key];
   }
   if (metadata.orchestratorTarget !== undefined) process.env.PI_SUBAGENT_ORCHESTRATOR_TARGET = metadata.orchestratorTarget;
+  if (metadata.orchestratorSessionId !== undefined) process.env.PI_SUBAGENT_ORCHESTRATOR_SESSION_ID = metadata.orchestratorSessionId;
+  if (metadata.inheritedIntercomSessionId !== undefined) process.env.PI_INTERCOM_SESSION_ID = metadata.inheritedIntercomSessionId;
+  if (metadata.namePollMs !== undefined) process.env.PI_INTERCOM_NAME_POLL_MS = metadata.namePollMs;
   if (metadata.runId !== undefined) process.env.PI_SUBAGENT_RUN_ID = metadata.runId;
   if (metadata.agent !== undefined) process.env.PI_SUBAGENT_CHILD_AGENT = metadata.agent;
   if (metadata.index !== undefined) process.env.PI_SUBAGENT_CHILD_INDEX = metadata.index;
@@ -132,7 +141,6 @@ async function waitForCondition(description: string, predicate: () => boolean | 
 
 interface CapturedToolResult {
   content: Array<{ type: string; text: string }>;
-  isError: boolean;
   details?: Record<string, unknown>;
 }
 
@@ -167,12 +175,14 @@ function renderToText(component: RenderedComponent): string {
   return component.render(120).map((line) => line.trimEnd()).join("\n");
 }
 
-function createExtensionHarness(sessionName = "child-worker", options: {
+function createExtensionHarness(sessionName: string | (() => string) = "child-worker", options: {
   abort?: () => void;
   hasUI?: boolean;
   isIdle?: () => boolean;
   hasPendingMessages?: () => boolean;
+  mode?: "tui" | "rpc" | "json" | "print";
   ui?: unknown;
+  sessionId?: string | (() => string);
 } = {}) {
   const events = new EventEmitter();
   const lifecycleHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
@@ -181,7 +191,7 @@ function createExtensionHarness(sessionName = "child-worker", options: {
   const entries: Array<{ type: string; data: unknown }> = [];
   const sentMessages: Array<{ message: { customType?: string; content?: string; details?: unknown }; options?: { triggerTurn?: boolean; deliverAs?: string } }> = [];
   const pi = {
-    getSessionName: () => sessionName,
+    getSessionName: () => typeof sessionName === "function" ? sessionName() : sessionName,
     events: {
       on: (channel: string, handler: (payload: unknown) => void) => {
         events.on(channel, handler);
@@ -209,8 +219,9 @@ function createExtensionHarness(sessionName = "child-worker", options: {
   };
   const ctx = {
     cwd: repoDir,
+    mode: options.mode ?? (options.hasUI ? "tui" : "print"),
     model: { id: "child-model" },
-    sessionManager: { getSessionId: () => "session-child-test" },
+    sessionManager: { getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test" },
     isIdle: options.isIdle ?? (() => true),
     hasPendingMessages: options.hasPendingMessages ?? (() => false),
     hasUI: options.hasUI ?? false,
@@ -229,7 +240,47 @@ function createExtensionHarness(sessionName = "child-worker", options: {
         await handler(payload, eventContext);
       }
     },
+    async emitLifecycleResults(event: string, payload: unknown = {}, eventContext: unknown = ctx) {
+      const results = [];
+      for (const handler of lifecycleHandlers.get(event) ?? []) {
+        results.push(await handler(payload, eventContext));
+      }
+      return results;
+    },
   };
+}
+
+async function connectRawRegistered(sessionId: string, name: string) {
+  const net = await import("node:net");
+  const { getBrokerSocketPath } = await import("./broker/paths.ts");
+  const { createMessageReader, writeMessage } = await import("./broker/framing.ts");
+  const socket = net.connect(getBrokerSocketPath());
+  await once(socket, "connect");
+  const registered = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Raw register timed out")), 2000);
+    const reader = createMessageReader((msg) => {
+      if (typeof msg === "object" && msg !== null && "type" in msg && msg.type === "registered") {
+        clearTimeout(timeout);
+        socket.off("data", reader);
+        resolve();
+      }
+    }, reject);
+    socket.on("data", reader);
+  });
+  writeMessage(socket, {
+    type: "register",
+    sessionId,
+    session: {
+      name,
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    },
+  });
+  await registered;
+  return { socket, writeMessage };
 }
 
 async function setupClients() {
@@ -335,6 +386,218 @@ async function waitForSessionModel(client: InstanceType<typeof IntercomClient>, 
   throw new Error(`Timed out waiting for ${name} model ${model}; saw ${JSON.stringify(sessions.map((session) => ({ name: session.name, model: session.model })))}`);
 }
 
+async function waitForSessionId(client: InstanceType<typeof IntercomClient>, sessionId: string): Promise<SessionInfo> {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    const session = (await client.listSessions()).find((candidate) => candidate.id === sessionId);
+    if (session) {
+      return session;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const sessions = await client.listSessions();
+  throw new Error(`Timed out waiting for ${sessionId}; saw ${JSON.stringify(sessions.map((session) => session.id))}`);
+}
+
+async function waitForNoSessionId(client: InstanceType<typeof IntercomClient>, sessionId: string): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (!(await client.listSessions()).some((candidate) => candidate.id === sessionId)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${sessionId} to leave`);
+}
+
+test("broker accepts caller supplied stable IDs across reconnect", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const worker = new IntercomClient();
+
+  try {
+    await worker.connect({
+      name: "stable-worker",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "stable-session-id");
+    assert.equal(worker.sessionId, "stable-session-id");
+    await waitForSessionId(planner, "stable-session-id");
+    await worker.disconnect();
+    await waitForNoSessionId(planner, "stable-session-id");
+
+    const reconnected = new IntercomClient();
+    await reconnected.connect({
+      name: "stable-worker",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "stable-session-id");
+    assert.equal(reconnected.sessionId, "stable-session-id");
+    await waitForSessionId(planner, "stable-session-id");
+    await reconnected.disconnect();
+  } finally {
+    await worker.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("old stable-ID socket cannot mutate the replacement session", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const first = await connectRawRegistered("replaceable-session-id", "replaceable-worker-old");
+  const replacement = new IntercomClient();
+
+  try {
+    await replacement.connect({
+      name: "replaceable-worker-new",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "replaceable-session-id");
+
+    first.writeMessage(first.socket, { type: "presence", name: "stale-name" });
+    first.writeMessage(first.socket, { type: "unregister" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const replacementSession = await waitForSessionId(planner, "replaceable-session-id");
+    assert.equal(replacementSession.name, "replaceable-worker-new");
+
+    const received = once(replacement, "message") as Promise<[SessionInfo, Message]>;
+    const sent = await planner.send("replaceable-session-id", { text: "still there" });
+    assert.equal(sent.delivered, true);
+    const [, message] = await received;
+    assert.equal(message.content.text, "still there");
+  } finally {
+    first.socket.destroy();
+    await replacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("stable-ID replacement clears old ask edges and ignores stale cancels", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const first = await connectRawRegistered("replaceable-asker-id", "replaceable-asker-old");
+  const replacement = new IntercomClient();
+
+  try {
+    first.writeMessage(first.socket, {
+      type: "send",
+      to: orchestrator.sessionId,
+      message: { id: "old-ask-edge", timestamp: Date.now(), expectsReply: true, content: { text: "Old ask" } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    await replacement.connect({
+      name: "replaceable-asker-new",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "replaceable-asker-id");
+
+    const reverseAfterReplace = await orchestrator.send("replaceable-asker-id", {
+      messageId: "reverse-after-replace",
+      text: "Can I ask the replacement?",
+      expectsReply: true,
+    });
+    assert.equal(reverseAfterReplace.delivered, true);
+    assert.equal((await replacement.send(orchestrator.sessionId!, {
+      text: "Replacement answered.",
+      replyTo: "reverse-after-replace",
+    })).delivered, true);
+
+    const replacementAsk = await replacement.send(orchestrator.sessionId!, {
+      messageId: "replacement-ask-edge",
+      text: "Replacement ask",
+      expectsReply: true,
+    });
+    assert.equal(replacementAsk.delivered, true);
+    first.writeMessage(first.socket, { type: "cancel_ask", messageId: "replacement-ask-edge" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const reverseWhileReplacementWaits = await orchestrator.send("replaceable-asker-id", {
+      messageId: "reverse-while-replacement-waits",
+      text: "Can I ask while replacement waits?",
+      expectsReply: true,
+    });
+    assert.equal(reverseWhileReplacementWaits.delivered, false);
+    assert.match(reverseWhileReplacementWaits.reason ?? "", /Mutual ask refused/);
+  } finally {
+    first.socket.destroy();
+    await replacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("broker resolves unique short IDs and rejects ambiguous prefixes", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const first = new IntercomClient();
+  const second = new IntercomClient();
+  const evilPrefix = new IntercomClient();
+
+  try {
+    await first.connect({ name: "short-id-one", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "abcdef12-session");
+    await second.connect({ name: "short-id-two", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "abcdef99-session");
+    await evilPrefix.connect({ name: "evil-prefix", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "orchestrator-evil");
+
+    const received = once(first, "message") as Promise<[SessionInfo, Message]>;
+    const unique = await planner.send("abcdef12", { text: "prefix works" });
+    assert.equal(unique.delivered, true);
+    const [, message] = await received;
+    assert.equal(message.content.text, "prefix works");
+
+    const ambiguous = await planner.send("abcdef", { text: "ambiguous" });
+    assert.equal(ambiguous.delivered, false);
+    assert.match(ambiguous.reason ?? "", /Multiple sessions/);
+
+    const exactNameReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    const exactName = await planner.send("orchestrator", { text: "exact name wins" });
+    assert.equal(exactName.delivered, true);
+    const [, exactNameMessage] = await exactNameReceived;
+    assert.equal(exactNameMessage.content.text, "exact name wins");
+  } finally {
+    await first.disconnect().catch(() => undefined);
+    await second.disconnect().catch(() => undefined);
+    await evilPrefix.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("intercom tool prefers exact names over ID prefixes", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const evilPrefix = new IntercomClient();
+  const harness = createExtensionHarness("exact-name-worker");
+
+  try {
+    await evilPrefix.connect({ name: "evil-prefix", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, "orchestrator-evil");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const exactNameReceived = Promise.race([
+      once(orchestrator, "message") as Promise<[SessionInfo, Message]>,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+    ]);
+    const result = await intercomTool.execute("send-exact-name", { action: "send", to: "orchestrator", message: "exact name wins" }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(result.details?.error, true);
+
+    const received = await exactNameReceived;
+    assert.notEqual(received, null);
+    assert.equal(received![1].content.text, "exact name wins");
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await evilPrefix.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
 test("intercom tool renders compact call and result rows", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness();
@@ -363,6 +626,30 @@ test("intercom tool renders compact call and result rows", async () => {
   }, { isPartial: false, expanded: true }, renderTheme, { isError: false, expanded: true }));
   assert.match(errorText, /✗ Missing 'to' or 'message' parameter/);
   assert.match(errorText, /Reason: Missing target/);
+});
+
+test("intercom tool result hook marks failed details as errors", async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness();
+  piIntercomExtension(harness.pi as never);
+
+  const errorResults = await harness.emitLifecycleResults("tool_result", {
+    toolName: "intercom",
+    details: { error: true },
+  });
+  assert.deepEqual(errorResults.filter(Boolean), [{ isError: true }]);
+
+  const deliveryResults = await harness.emitLifecycleResults("tool_result", {
+    toolName: "contact_supervisor",
+    details: { delivered: false },
+  });
+  assert.deepEqual(deliveryResults.filter(Boolean), [{ isError: true }]);
+
+  const okResults = await harness.emitLifecycleResults("tool_result", {
+    toolName: "intercom",
+    details: { delivered: true },
+  });
+  assert.deepEqual(okResults.filter(Boolean), []);
 });
 
 test("contact supervisor tool renders reason and reply state", async () => {
@@ -473,6 +760,50 @@ test("intercom tool resolves a target by the short id shown in list", { concurre
     assert.equal(result.details?.delivered, true);
     const message = await received;
     assert.match(message.content.text ?? "", /ping via short id/);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("idle name poll propagates /name changes without other activity", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  let sessionName = "idle-name-before";
+  const harness = createExtensionHarness(() => sessionName, { hasUI: true });
+
+  try {
+    await withChildOrchestratorEnv({ namePollMs: "25" }, async () => {
+      const { default: piIntercomExtension } = await import("./index.ts");
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      await waitForSessionByName(planner, "idle-name-before");
+      sessionName = "idle-name-after";
+      await waitForSessionByName(planner, "idle-name-after");
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("turn_start re-registers when Pi replaces the session context", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  let sessionName = "fork-before";
+  let sessionId = "session-fork-before";
+  const harness = createExtensionHarness(() => sessionName, { hasUI: true, sessionId: () => sessionId });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionId(planner, "session-fork-before");
+
+    sessionName = "fork-after";
+    sessionId = "session-fork-after";
+    await harness.emitLifecycle("turn_start");
+    const replaced = await waitForSessionId(planner, "session-fork-after");
+    assert.equal(replaced.name, "fork-after");
+    await waitForNoSessionId(planner, "session-fork-before");
   } finally {
     await harness.emitLifecycle("session_shutdown");
     await cleanup();
@@ -794,7 +1125,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       const reply = await orchestrator.send(askFrom.id, { text: "Use the stable API.", replyTo: askMessage.id });
       assert.equal(reply.delivered, true);
       const askResult = await askResultPromise;
-      assert.equal(askResult.isError, false);
+      assert.notEqual(askResult.details?.error, true);
       assert.match(askResult.content[0]?.text ?? "", /Use the stable API/);
 
       const updateReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
@@ -805,7 +1136,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       assert.match(updateMessage.content.text, /Run: 78f659a3/);
       assert.match(updateMessage.content.text, /Agent: worker/);
       assert.match(updateMessage.content.text, /Found a schema mismatch/);
-      assert.equal(updateResult.isError, false);
+      assert.notEqual(updateResult.details?.error, true);
 
       const interviewReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const interview = {
@@ -846,7 +1177,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       });
       assert.equal(interviewReply.delivered, true);
       const interviewResult = await interviewResultPromise;
-      assert.equal(interviewResult.isError, false);
+      assert.notEqual(interviewResult.details?.error, true);
       assert.match(interviewResult.content[0]?.text ?? "", /Stable API/);
       assert.deepEqual(interviewResult.details?.structuredReply, structuredReply);
 
@@ -862,13 +1193,53 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       });
       assert.equal(invalidReply.delivered, true);
       const invalidReplyResult = await invalidReplyResultPromise;
-      assert.equal(invalidReplyResult.isError, false);
+      assert.notEqual(invalidReplyResult.details?.error, true);
       assert.equal(invalidReplyResult.details?.structuredReply, undefined);
       assert.match(String(invalidReplyResult.details?.structuredReplyParseError), /must match one of the question options/);
 
       await harness.emitLifecycle("session_shutdown");
     });
   } finally {
+    await cleanup();
+  }
+});
+
+test("child supervisor tool uses stable supervisor ID when names are duplicated", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const duplicate = new IntercomClient();
+
+  try {
+    await duplicate.connect({
+      name: "orchestrator",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "duplicate-orchestrator-id");
+
+    await withChildOrchestratorEnv({
+      orchestratorTarget: "orchestrator",
+      orchestratorSessionId: orchestrator.sessionId!,
+      runId: "78f659a3",
+      agent: "worker",
+      index: "0",
+    }, async () => {
+      const { default: piIntercomExtension } = await import("./index.ts");
+      const harness = createExtensionHarness("duplicate-name-child");
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
+
+      const received = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const result = await supervisorTool.execute("update-duplicate", { reason: "progress_update", message: "Stable ID route." }, new AbortController().signal, undefined, harness.ctx);
+      const [, message] = await received;
+      assert.notEqual(result.details?.error, true);
+      assert.match(message.content.text, /Stable ID route/);
+      await harness.emitLifecycle("session_shutdown");
+    });
+  } finally {
+    await duplicate.disconnect().catch(() => undefined);
     await cleanup();
   }
 });
@@ -886,15 +1257,15 @@ test("child supervisor tool rejects invalid reasons and interview payloads", asy
     piIntercomExtension(harness.pi as never);
     const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
     const result = await supervisorTool.execute("invalid-1", { reason: "done", message: "Finished." }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(result.isError, true);
+    assert.equal(result.details?.error, true);
     assert.match(result.content[0]?.text ?? "", /Invalid reason/);
 
     const missingMessageResult = await supervisorTool.execute("invalid-message", { reason: "need_decision" }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(missingMessageResult.isError, true);
+    assert.equal(missingMessageResult.details?.error, true);
     assert.match(missingMessageResult.content[0]?.text ?? "", /Missing 'message'/);
 
     const invalidInterviewResult = await supervisorTool.execute("invalid-interview", { reason: "interview_request", interview: { title: "Bad" } }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(invalidInterviewResult.isError, true);
+    assert.equal(invalidInterviewResult.details?.error, true);
     assert.match(invalidInterviewResult.content[0]?.text ?? "", /interview\.questions must be a non-empty array/);
 
     const invalidInfoOptionsResult = await supervisorTool.execute("invalid-info-options", {
@@ -903,7 +1274,7 @@ test("child supervisor tool rejects invalid reasons and interview payloads", asy
         questions: [{ id: "context", type: "info", question: "Context", options: ["Not an answer"] }],
       },
     }, new AbortController().signal, undefined, harness.ctx);
-    assert.equal(invalidInfoOptionsResult.isError, true);
+    assert.equal(invalidInfoOptionsResult.details?.error, true);
     assert.match(invalidInfoOptionsResult.content[0]?.text ?? "", /options is only valid for single and multi questions/);
   });
 });
@@ -924,20 +1295,213 @@ test("child supervisor tool preserves delivery failure reasons", { concurrency: 
       await harness.emitLifecycle("session_start");
       const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor")!;
       const updateResult = await supervisorTool.execute("update-1", { reason: "progress_update", message: "Blocked." }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(updateResult.isError, true);
+      assert.equal(updateResult.details?.delivered, false);
       assert.match(updateResult.content[0]?.text ?? "", /Session not found/);
       assert.equal(updateResult.details?.reason, "Session not found");
 
       const askResult = await supervisorTool.execute("ask-1", { reason: "need_decision", message: "Which path?" }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(askResult.isError, true);
+      assert.equal(askResult.details?.error, true);
       assert.match(askResult.content[0]?.text ?? "", /Session not found/);
 
       const secondAskResult = await supervisorTool.execute("ask-2", { reason: "need_decision", message: "Still blocked." }, new AbortController().signal, undefined, harness.ctx);
-      assert.equal(secondAskResult.isError, true);
+      assert.equal(secondAskResult.details?.error, true);
       assert.match(secondAskResult.content[0]?.text ?? "", /Session not found/);
       assert.doesNotMatch(secondAskResult.content[0]?.text ?? "", /Already waiting/);
       await harness.emitLifecycle("session_shutdown");
     });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("regular intercom asks fail safely when started concurrently", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+
+  try {
+    const harness = createExtensionHarness("regular-ask-worker");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(orchestrator, "regular-ask-worker");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const firstMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    const firstAsk = intercomTool.execute("ask-1", { action: "ask", to: "orchestrator", message: "First?" }, new AbortController().signal, undefined, harness.ctx);
+    const secondAsk = intercomTool.execute("ask-2", { action: "ask", to: "orchestrator", message: "Second?" }, new AbortController().signal, undefined, harness.ctx);
+    const [from, askMessage] = await firstMessage;
+    assert.equal(askMessage.expectsReply, true);
+
+    const earlyResults = await Promise.race([
+      Promise.all([firstAsk, secondAsk]),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 100)),
+    ]);
+    assert.equal(earlyResults, null);
+
+    const pendingResult = await Promise.race([firstAsk, secondAsk]);
+    assert.equal(pendingResult.details?.error, true);
+    assert.match(pendingResult.content[0]?.text ?? "", /Already waiting/);
+
+    const reply = await orchestrator.send(from.id, { text: "First answer.", replyTo: askMessage.id });
+    assert.equal(reply.delivered, true);
+
+    const results = await Promise.all([firstAsk, secondAsk]);
+    assert.equal(results.filter((result) => result.details?.error === true).length, 1);
+    assert.equal(results.filter((result) => /First answer/.test(result.content[0]?.text ?? "")).length, 1);
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("broker refuses reverse mutual asks until the original ask is answered", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+
+  try {
+    const askToOrchestrator = await planner.send(orchestrator.sessionId!, {
+      messageId: "planner-to-orchestrator",
+      text: "Can you decide?",
+      expectsReply: true,
+    });
+    assert.equal(askToOrchestrator.delivered, true);
+
+    const reverseAsk = await orchestrator.send(planner.sessionId!, {
+      messageId: "orchestrator-to-planner",
+      text: "Can you decide instead?",
+      expectsReply: true,
+    });
+    assert.equal(reverseAsk.delivered, false);
+    assert.match(reverseAsk.reason ?? "", /Mutual ask refused/);
+
+    const plainSend = await orchestrator.send(planner.sessionId!, { text: "Plain update still works." });
+    assert.equal(plainSend.delivered, true);
+
+    const reply = await orchestrator.send(planner.sessionId!, {
+      text: "Answered.",
+      replyTo: "planner-to-orchestrator",
+    });
+    assert.equal(reply.delivered, true);
+
+    const nextAsk = await orchestrator.send(planner.sessionId!, {
+      messageId: "orchestrator-to-planner-after-reply",
+      text: "Now can I ask?",
+      expectsReply: true,
+    });
+    assert.equal(nextAsk.delivered, true);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a reply can start a new reverse ask", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+
+  try {
+    const askToOrchestrator = await planner.send(orchestrator.sessionId!, {
+      messageId: "planner-to-orchestrator-transition",
+      text: "Can you decide?",
+      expectsReply: true,
+    });
+    assert.equal(askToOrchestrator.delivered, true);
+
+    const replyAndAsk = await orchestrator.send(planner.sessionId!, {
+      messageId: "orchestrator-reply-and-ask",
+      text: "I answered; can you decide the next thing?",
+      replyTo: "planner-to-orchestrator-transition",
+      expectsReply: true,
+    });
+    assert.equal(replyAndAsk.delivered, true);
+
+    const duplicateReverseAsk = await orchestrator.send(planner.sessionId!, {
+      messageId: "orchestrator-duplicate-reverse-ask",
+      text: "Can I ask another before the first is answered?",
+      expectsReply: true,
+    });
+    assert.equal(duplicateReverseAsk.delivered, true);
+
+    const plannerReverseAsk = await planner.send(orchestrator.sessionId!, {
+      messageId: "planner-reverse-while-orchestrator-waits",
+      text: "Can I ask while you wait?",
+      expectsReply: true,
+    });
+    assert.equal(plannerReverseAsk.delivered, false);
+    assert.match(plannerReverseAsk.reason ?? "", /Mutual ask refused/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("failed replies do not clear broker mutual-ask edges", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+
+  try {
+    const askToOrchestrator = await planner.send(orchestrator.sessionId!, {
+      messageId: "planner-to-orchestrator-missing-reply",
+      text: "Can you decide?",
+      expectsReply: true,
+    });
+    assert.equal(askToOrchestrator.delivered, true);
+
+    const missingReply = await orchestrator.send("missing-session", {
+      messageId: "reply-to-missing-session",
+      text: "Answered, maybe?",
+      replyTo: "planner-to-orchestrator-missing-reply",
+    });
+    assert.equal(missingReply.delivered, false);
+    assert.match(missingReply.reason ?? "", /Session not found/);
+
+    const reverseAsk = await orchestrator.send(planner.sessionId!, {
+      messageId: "reverse-after-missing-reply",
+      text: "Can I ask now?",
+      expectsReply: true,
+    });
+    assert.equal(reverseAsk.delivered, false);
+    assert.match(reverseAsk.reason ?? "", /Mutual ask refused/);
+
+    const deliveredReply = await orchestrator.send(planner.sessionId!, {
+      messageId: "reply-to-planner",
+      text: "Actually answered.",
+      replyTo: "planner-to-orchestrator-missing-reply",
+    });
+    assert.equal(deliveredReply.delivered, true);
+
+    const nextAsk = await orchestrator.send(planner.sessionId!, {
+      messageId: "reverse-after-delivered-reply",
+      text: "Now can I ask?",
+      expectsReply: true,
+    });
+    assert.equal(nextAsk.delivered, true);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("regular intercom ask cancellation clears broker mutual-ask edge", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { orchestrator, cleanup } = await setupClients();
+
+  try {
+    const harness = createExtensionHarness("cancel-cleanup-worker");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(orchestrator, "cancel-cleanup-worker");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const controller = new AbortController();
+    const cancelledMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    const cancelledResultPromise = intercomTool.execute("ask-cancelled", { action: "ask", to: "orchestrator", message: "Should I continue?" }, controller.signal, undefined, harness.ctx);
+    await cancelledMessage;
+    controller.abort();
+    const cancelledResult = await cancelledResultPromise;
+    assert.equal(cancelledResult.details?.error, true);
+    assert.match(cancelledResult.content[0]?.text ?? "", /Cancelled/);
+
+    const reverseAsk = await orchestrator.send(worker.id, {
+      messageId: "reverse-after-cancel",
+      text: "Can I ask after your cancellation?",
+      expectsReply: true,
+    });
+    assert.equal(reverseAsk.delivered, true);
+    await harness.emitLifecycle("session_shutdown");
   } finally {
     await cleanup();
   }
@@ -966,7 +1530,7 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       await cancelledMessage;
       controller.abort();
       const cancelledResult = await cancelledResultPromise;
-      assert.equal(cancelledResult.isError, true);
+      assert.equal(cancelledResult.details?.error, true);
       assert.match(cancelledResult.content[0]?.text ?? "", /Cancelled/);
 
       const nextMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
@@ -976,7 +1540,7 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       const reply = await orchestrator.send(from.id, { text: "Yes.", replyTo: message.id });
       assert.equal(reply.delivered, true);
       const nextResult = await nextResultPromise;
-      assert.equal(nextResult.isError, false);
+      assert.notEqual(nextResult.details?.error, true);
       assert.match(nextResult.content[0]?.text ?? "", /Yes\./);
       await harness.emitLifecycle("session_shutdown");
     });
@@ -1019,6 +1583,70 @@ test("full ask/reply round-trip works with reply target resolved from current tu
     assert.equal(reply.message.replyTo, askId);
     assert.deepEqual(replyTracker.listPending(Date.now()), []);
   } finally {
+    await cleanup();
+  }
+});
+
+test("intercom reply targets exact replyTo when multiple asks are pending", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("reply-target-worker");
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "reply-target-worker");
+
+    assert.equal((await planner.send(worker.id, { messageId: "reply-target-1", text: "First?", expectsReply: true })).delivered, true);
+    assert.equal((await orchestrator.send(worker.id, { messageId: "reply-target-2", text: "Second?", expectsReply: true })).delivered, true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const replyReceived = waitForReply(orchestrator, "reply-target-2");
+    const result = await intercomTool.execute("reply-exact", {
+      action: "reply",
+      message: "Second answer.",
+      replyTo: "reply-target-2",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(result.details?.error, true);
+    const reply = await replyReceived;
+    assert.equal(reply.message.content.text, "Second answer.");
+
+    const pending = await intercomTool.execute("pending-after-exact", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(pending.content[0]?.text ?? "", /reply-target-1/);
+    assert.doesNotMatch(pending.content[0]?.text ?? "", /reply-target-2/);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("intercom reply dismisses stale pending ask only when sender session is gone", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("stale-reply-worker");
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "stale-reply-worker");
+    assert.equal((await planner.send(worker.id, { messageId: "stale-reply-ask", text: "Still there?", expectsReply: true })).delivered, true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await planner.disconnect();
+
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const result = await intercomTool.execute("reply-stale", {
+      action: "reply",
+      message: "No sender remains.",
+      replyTo: "stale-reply-ask",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(result.details?.delivered, false);
+    assert.equal(result.details?.reason, "Session not found");
+
+    const pending = await intercomTool.execute("pending-after-stale", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(pending.content[0]?.text ?? "", /No unresolved inbound asks/);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
 });

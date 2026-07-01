@@ -1,7 +1,7 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { SessionInfo, Message } from "../types.js";
+import type { SessionInfo, Message } from "../types.ts";
 
 export class InlineMessageComponent implements Component {
   private from: SessionInfo;

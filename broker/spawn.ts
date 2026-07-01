@@ -1,12 +1,18 @@
 import { spawn } from "child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { homedir } from "os";
+import { createRequire } from "module";
 import net from "net";
-import { getBrokerSocketPath } from "./paths.js";
+import {
+  ensureIntercomRuntimeDir,
+  getBrokerSocketPath,
+  getIntercomDirPath,
+  INTERCOM_RUNTIME_FILE_MODE,
+  restrictIntercomRuntimeFile,
+} from "./paths.ts";
 
-const INTERCOM_DIR = join(homedir(), ".pi/agent/intercom");
+const INTERCOM_DIR = getIntercomDirPath();
 const EXTENSION_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const BROKER_SOCKET = getBrokerSocketPath();
 const BROKER_PID = join(INTERCOM_DIR, "broker.pid");
@@ -31,7 +37,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function getTsxCliPath(extensionDir: string = EXTENSION_DIR): string {
-  return join(extensionDir, "node_modules", "tsx", "dist", "cli.mjs");
+  // Resolve tsx via Node's module resolution so it works regardless of whether
+  // tsx is bundled under extensionDir/node_modules or hoisted to a workspace
+  // root by npm. We resolve the tsx package main entry (its "exports" field
+  // does not expose ./dist/cli.mjs as a subpath) and then locate cli.mjs next
+  // to it. Falls back to the legacy relative path if resolution fails.
+  try {
+    const requireFromExtension = createRequire(import.meta.url);
+    const tsxMain = requireFromExtension.resolve("tsx");
+    return join(dirname(tsxMain), "cli.mjs");
+  } catch {
+    return join(extensionDir, "node_modules", "tsx", "dist", "cli.mjs");
+  }
 }
 
 function quoteWindowsArg(value: string): string {
@@ -76,8 +93,12 @@ function writeWindowsHiddenLauncher(
   commandLine: string,
   launcherPath: string = getWindowsHiddenLauncherPath(),
 ): string {
-  mkdirSync(dirname(launcherPath), { recursive: true });
-  writeFileSync(launcherPath, getWindowsHiddenLauncherScript(commandLine), "utf-8");
+  ensureIntercomRuntimeDir(dirname(launcherPath));
+  writeFileSync(launcherPath, getWindowsHiddenLauncherScript(commandLine), {
+    encoding: "utf-8",
+    mode: INTERCOM_RUNTIME_FILE_MODE,
+  });
+  restrictIntercomRuntimeFile(launcherPath);
   return launcherPath;
 }
 
@@ -129,7 +150,7 @@ function toError(error: unknown): Error {
 }
 
 export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: string[]): Promise<void> {
-  mkdirSync(INTERCOM_DIR, { recursive: true });
+  ensureIntercomRuntimeDir(INTERCOM_DIR);
 
   if (await isBrokerRunning()) {
     return;
@@ -240,7 +261,11 @@ function acquireSpawnLock(): boolean {
   const maxRetries = 5;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      writeFileSync(BROKER_SPAWN_LOCK, `${process.pid}\n${Date.now()}\n`, { flag: "wx" });
+      writeFileSync(BROKER_SPAWN_LOCK, `${process.pid}\n${Date.now()}\n`, {
+        flag: "wx",
+        mode: INTERCOM_RUNTIME_FILE_MODE,
+      });
+      restrictIntercomRuntimeFile(BROKER_SPAWN_LOCK);
       return true;
     } catch (error) {
       if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "EEXIST") {

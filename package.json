@@ -20,7 +20,7 @@
     "skills/**/*"
   ],
   "scripts": {
-    "test": "tsx --test background-lineage.test.ts broker/paths.test.ts broker/spawn.test.ts clipboard.test.ts config.test.ts context-compaction.test.ts fork-handler.test.ts fork-routing.test.ts fork-runtime-state.test.ts reply-tracker.test.ts intercom.integration.test.ts test/inline-message.test.ts"
+    "test": "tsx --test background-lineage.test.ts broker/client.test.ts broker/framing.test.ts broker/paths.test.ts broker/spawn.test.ts clipboard.test.ts config.test.ts context-compaction.test.ts fork-handler.test.ts fork-routing.test.ts fork-runtime-state.test.ts reply-tracker.test.ts intercom.integration.test.ts test/inline-message.test.ts test/overlay-width.test.ts"
   },
   "keywords": [
     "pi-package"
@@ -34,6 +34,7 @@
     ]
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "pi-forks": "^0.1.0"
@@ -44,12 +45,13 @@
     }
   },
   "dependencies": {
-    "tsx": "^4.22.3",
+    "tsx": "^4.20.0",
     "typebox": "^1.1.38"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.75.5",
-    "@earendil-works/pi-tui": "^0.75.5",
+    "@earendil-works/pi-ai": "^0.79.8",
+    "@earendil-works/pi-coding-agent": "^0.79.8",
+    "@earendil-works/pi-tui": "^0.79.8",
     "typescript": "^6.0.3"
   }
 }
