@@ -121,6 +121,8 @@ function installedPiForksBackgroundEventsModule(): string | undefined {
 let handlerRuns: IntercomForkHandlerRun[] = [];
 let backgroundQueueDrainActive = false;
 let backgroundQueueDrainPending = false;
+let backgroundQueueDrainTimer: ReturnType<typeof setTimeout> | undefined;
+const MAX_BACKGROUND_QUEUE_DRAIN_PASSES = 5;
 
 async function loadHandlers(): Promise<void> {
   try {
@@ -599,6 +601,7 @@ async function fillHandlerOutput(run: IntercomForkHandlerRun): Promise<{ stdout:
 export async function reconcileIntercomForkHandlers(pi?: Pick<ExtensionAPI, "appendEntry">): Promise<number> {
   await loadHandlers();
   let changed = 0;
+  const reconciledRuns: IntercomForkHandlerRun[] = [];
   for (const run of handlerRuns) {
     if (run.status !== "starting" && run.status !== "running") continue;
     if (run.status === "running" && isProcessAlive(run.pid)) continue;
@@ -618,6 +621,7 @@ export async function reconcileIntercomForkHandlers(pi?: Pick<ExtensionAPI, "app
     }
     await cleanupParentSessionSnapshot(run);
     changed += 1;
+    reconciledRuns.push(run);
     try {
       pi?.appendEntry?.("intercom_fork_handler_reconciled", { id: run.id, status: run.status, pid: run.pid, endedAt: run.endedAt });
     } catch {
@@ -625,7 +629,14 @@ export async function reconcileIntercomForkHandlers(pi?: Pick<ExtensionAPI, "app
     }
   }
   if (await cleanupStoredCompletedSnapshots()) changed += 1;
-  if (changed > 0) await saveHandlers();
+  if (changed > 0) {
+    await saveHandlers();
+    for (const run of reconciledRuns) {
+      await completeBackgroundHandler(run).catch((error) => {
+        console.error("[pi-intercom] Failed to complete reconciled background event handler", error);
+      });
+    }
+  }
   return changed;
 }
 
@@ -643,9 +654,9 @@ async function markHandlerFinished(pi: ExtensionAPI, ctx: ExtensionContext, conf
   await completeBackgroundHandler(run).catch((error) => {
     console.error("[pi-intercom] Failed to complete background event handler", error);
   });
-  await kickIntercomBackgroundQueueDrain(pi, ctx, config, `handler ${run.id} finished`);
   await cleanupParentSessionSnapshot(run);
   await saveHandlers();
+  kickIntercomBackgroundQueueDrain(pi, ctx, config, `handler ${run.id} finished`);
   try {
     pi.appendEntry?.("intercom_fork_handler_finished", { id: run.id, status: run.status, messageId: run.messageId, exitCode: code, signal, endedAt: run.endedAt });
   } catch {
@@ -739,10 +750,7 @@ export async function launchIntercomForkHandler(pi: ExtensionAPI, ctx: Extension
         ...(run.parentIntercomTarget ? { [INTERCOM_PARENT_INTERCOM_TARGET_ENV]: run.parentIntercomTarget } : {}),
       }),
       onClose: (code, signal) => {
-        void (async () => {
-          await markHandlerFinished(pi, ctx, config, run.id, code, signal, config.notify, config.triggerParentOnSummary);
-          await kickIntercomBackgroundQueueDrain(pi, ctx, config, `handler ${run.id} finished`);
-        })().catch((error) => {
+        void markHandlerFinished(pi, ctx, config, run.id, code, signal, config.notify, config.triggerParentOnSummary).catch((error) => {
           console.error("[pi-intercom] Failed to finish fork handler", error);
         });
       },
@@ -823,22 +831,36 @@ export async function drainIntercomBackgroundQueue(pi: ExtensionAPI, ctx: Extens
   }
 }
 
-async function kickIntercomBackgroundQueueDrain(pi: ExtensionAPI, ctx: ExtensionContext, config: InboundForkHandlersConfig, reason: string): Promise<void> {
+function kickIntercomBackgroundQueueDrain(pi: ExtensionAPI, ctx: ExtensionContext, config: InboundForkHandlersConfig, reason: string): void {
+  if (backgroundQueueDrainTimer) {
+    backgroundQueueDrainPending = true;
+    return;
+  }
+  backgroundQueueDrainTimer = setTimeout(() => {
+    void drainIntercomBackgroundQueueLoop(pi, ctx, config, reason);
+  }, 0);
+  backgroundQueueDrainTimer.unref?.();
+}
+
+async function drainIntercomBackgroundQueueLoop(pi: ExtensionAPI, ctx: ExtensionContext, config: InboundForkHandlersConfig, reason: string): Promise<void> {
+  backgroundQueueDrainTimer = undefined;
   if (backgroundQueueDrainActive) {
     backgroundQueueDrainPending = true;
     return;
   }
   backgroundQueueDrainActive = true;
   try {
-    do {
+    for (let pass = 0; pass < MAX_BACKGROUND_QUEUE_DRAIN_PASSES; pass += 1) {
       backgroundQueueDrainPending = false;
-      await drainIntercomBackgroundQueue(pi, ctx, config);
-    } while (backgroundQueueDrainPending);
+      const launched = await drainIntercomBackgroundQueue(pi, ctx, config);
+      if (!backgroundQueueDrainPending && launched === 0) break;
+    }
   } catch (error) {
     console.error(`[pi-intercom] Failed to drain background queue after ${reason}:`, error);
   } finally {
     backgroundQueueDrainActive = false;
   }
+  if (backgroundQueueDrainPending) kickIntercomBackgroundQueueDrain(pi, ctx, config, "coalesced drain");
 }
 
 export async function listIntercomForkHandlers(status: "running" | "complete" | "failed" | "all" = "all"): Promise<IntercomForkHandlerRun[]> {
