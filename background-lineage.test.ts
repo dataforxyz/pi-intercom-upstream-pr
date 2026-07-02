@@ -27,6 +27,7 @@ test("lineage debug tag is stable and added once", () => {
 
 test("parseLineageDebugTag recovers visible lineage fallback", () => {
   assert.deepEqual(parseLineageDebugTag("[background-lineage:lin-1:depth-3]\nhello"), { lineageId: "lin-1", forkDepth: 3 });
+  assert.deepEqual(parseLineageDebugTag("[background-lineage:return_on:parent:job:x:depth-2]\nhello"), { lineageId: "return_on:parent:job:x", forkDepth: 2 });
   assert.equal(parseLineageDebugTag("hello"), undefined);
 });
 

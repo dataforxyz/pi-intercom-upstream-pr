@@ -111,6 +111,11 @@ test("auto parent trigger wakes local subagent relays without launching another 
   actionable.message.content.text = actionable.bodyText;
   assert.equal(shouldLaunchInboundForkHandler(actionable), true);
 
+  const routineComplete = makeEntry(false);
+  routineComplete.bodyText = "review complete, no action needed";
+  routineComplete.message.content.text = routineComplete.bodyText;
+  assert.equal(shouldLaunchInboundForkHandler(routineComplete), false);
+
   const control = makeEntry(false);
   control.from.id = "subagent-control";
   control.from.name = "subagent-control";

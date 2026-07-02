@@ -874,20 +874,20 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (config.inboundForkHandlers.when !== "always" && !shouldLaunchInboundForkHandler(entry)) return false;
     if (config.inboundForkHandlers.when === "busy" && !parentIsBusy) return false;
     if (config.inboundForkHandlers.when === "auto" && !parentIsBusy && !parentHasPendingMessages) return false;
-    const lineageGate = await chargeInboundForkLineage(entry).catch((error) => {
-      console.error("[pi-intercom] Failed to charge inbound fork lineage", error);
-      return { allowed: false, reason: "lineage-charge-failed" };
-    });
-    if (!lineageGate.allowed) {
-      pi.appendEntry("intercom_fork_handler_blocked", { messageId: entry.message.id, reason: lineageGate.reason ?? "lineage-budget", timestamp: Date.now() });
-      return false;
-    }
     const routerDecision = await routeInboundForkWithOptionalRouter(entry, parentIsBusy, parentHasPendingMessages).catch((error) => {
       console.error("[pi-intercom] Failed to run inbound fork router", error);
       return { decision: "fork" as const, reason: "router-error" };
     });
     if (routerDecision.decision !== "fork") {
       pi.appendEntry("intercom_fork_handler_blocked", { messageId: entry.message.id, reason: `router-${routerDecision.decision}:${routerDecision.reason}`, timestamp: Date.now() });
+      return false;
+    }
+    const lineageGate = await chargeInboundForkLineage(entry).catch((error) => {
+      console.error("[pi-intercom] Failed to charge inbound fork lineage", error);
+      return { allowed: false, reason: "lineage-charge-failed" };
+    });
+    if (!lineageGate.allowed) {
+      pi.appendEntry("intercom_fork_handler_blocked", { messageId: entry.message.id, reason: lineageGate.reason ?? "lineage-budget", timestamp: Date.now() });
       return false;
     }
     try {

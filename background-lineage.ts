@@ -45,7 +45,7 @@ export function withLineageDebugTag(message: string, lineage: BackgroundLineage 
 }
 
 export function parseLineageDebugTag(text: string): BackgroundLineage | undefined {
-  const match = text.match(/^\[background-lineage:([^:\]]+):depth-(\d+)\]/m);
+  const match = text.match(/^\[background-lineage:(.*):depth-(\d+)\]/m);
   if (!match) return undefined;
   return { lineageId: match[1], forkDepth: Number(match[2]) };
 }

@@ -134,8 +134,15 @@ async function loadHandlers(): Promise<void> {
   }
 }
 
+function retainedHandlerRuns(): IntercomForkHandlerRun[] {
+  const active = handlerRuns.filter((run) => run.status === "starting" || run.status === "running");
+  const activeIds = new Set(active.map((run) => run.id));
+  const terminal = handlerRuns.filter((run) => !activeIds.has(run.id)).slice(-200);
+  return [...terminal, ...active];
+}
+
 async function saveHandlers(): Promise<void> {
-  handlerRuns = handlerRuns.slice(-200);
+  handlerRuns = retainedHandlerRuns();
   await writeJsonAtomic(HANDLERS_FILE, { runs: handlerRuns });
 }
 
@@ -320,7 +327,7 @@ function explicitParentTrigger(text: string): boolean | undefined {
   return undefined;
 }
 
-const ACTIONABLE_PARENT_UPDATE_PATTERN = /\b(?:needs? (?:attention|decision|help)|blocked|review[- ]?complete|status:\s*completed)\b/i;
+const ACTIONABLE_PARENT_UPDATE_PATTERN = /\b(?:needs? (?:attention|decision|help)|blocked)\b/i;
 
 export function shouldLaunchInboundForkHandler(entry: InboundForkMessageEntry): boolean {
   // Local subagent bridge messages are already background-work summaries/control
