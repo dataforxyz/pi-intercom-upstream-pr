@@ -32,17 +32,23 @@ process.on("exit", () => {
   rmSync(sharedHomeDir, { recursive: true, force: true });
 });
 
-test("intercom contact id prefers unique session names and falls back to ids for duplicates", () => {
-  const current: SessionInfo = { id: "session-1", name: "main-dialog", cwd: "/tmp/project", model: "model", pid: 1, startedAt: 1, lastActivity: 2, status: "idle" };
-  const other: SessionInfo = { ...current, id: "session-2", name: "worker" };
-  assert.deepEqual(chooseContactTarget(current, [current, other]), { target: "main-dialog", name: "main-dialog", id: "session-1", duplicateName: false });
+test("intercom contact instruction uses unique session names and falls back to ids for duplicates", () => {
+  const current: SessionInfo = { id: "019f48bc-bfa6-7949-ac60-eeac6ea2f95b", name: "subagent-chat-019f48bc", cwd: "/tmp/project", model: "model", pid: 1, startedAt: 1, lastActivity: 2, status: "idle" };
+  const other: SessionInfo = { ...current, id: "019f48bd-1111-7111-8111-111111111111", name: "worker" };
+  const contact = chooseContactTarget(current, [current, other]);
+  assert.deepEqual(contact, {
+    target: "subagent-chat-019f48bc",
+    name: "subagent-chat-019f48bc",
+    id: "019f48bc-bfa6-7949-ac60-eeac6ea2f95b",
+    duplicateName: false,
+  });
+  assert.equal(formatContactInstruction(contact), "Intercom send ID: subagent-chat-019f48bc");
 
-  const duplicate = { ...other, name: "main-dialog" };
+  const duplicate = { ...other, name: "subagent-chat-019f48bc" };
   const fallback = chooseContactTarget(current, [current, duplicate]);
-  assert.equal(fallback.target, "session-1");
+  assert.equal(fallback.target, "019f48bc-bfa6-7949-ac60-eeac6ea2f95b");
   assert.equal(fallback.duplicateName, true);
-  assert.equal(formatContactInstruction(fallback), "Intercom send ID: session-1");
-  assert.equal(formatContactInstruction(chooseContactTarget(current, [current, other])), "Intercom send ID: session-1");
+  assert.equal(formatContactInstruction(fallback), "Intercom send ID: 019f48bc-bfa6-7949-ac60-eeac6ea2f95b");
 });
 
 async function waitForBrokerReady(broker: ChildProcessWithoutNullStreams): Promise<void> {

@@ -68,7 +68,7 @@ Press **Alt+M** or type `/intercom` to open the session list overlay:
 2. **Compose message** — Write your message in the compose overlay
 3. **Send** — Press Enter to send, Escape to cancel
 
-Press **Alt+I** or run `/intercom-id` to copy a short handoff snippet for the current session. The snippet includes the stable intercom session ID so another agent can message this session even when names are duplicated.
+Press **Alt+I** or run `/intercom-id` to copy a short handoff snippet for the current session. The snippet uses the session's unique name when possible, falling back to the stable intercom session ID when names are duplicated.
 
 ### From the Agent
 

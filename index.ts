@@ -432,7 +432,7 @@ export function chooseContactTarget(currentSession: SessionInfo, sessions: Sessi
 }
 
 export function formatContactInstruction(contact: { target: string; id: string; name?: string; duplicateName?: boolean }): string {
-  return `Intercom send ID: ${contact.id}`;
+  return `Intercom send ID: ${contact.target}`;
 }
 
 interface ClipboardCopyResult {
