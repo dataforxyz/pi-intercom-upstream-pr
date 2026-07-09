@@ -2,6 +2,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SessionInfo, Message } from "../types.ts";
+import { sanitizeDisplayText } from "./session-identity.ts";
 
 export class InlineMessageComponent implements Component {
   private from: SessionInfo;
@@ -32,13 +33,17 @@ export class InlineMessageComponent implements Component {
   render(width: number): string[] {
     const lines: string[] = [];
     const borderChar = "─";
-    const senderName = this.from.name || this.from.id.slice(0, 8);
+    const senderName = sanitizeDisplayText(
+      this.from.name,
+      sanitizeDisplayText(this.from.id.slice(0, 8), "Unknown sender"),
+    );
+    const senderCwd = sanitizeDisplayText(this.from.cwd, "Unknown path");
     if (width < 3) {
       return [truncateToWidth(`From ${senderName}`, width)];
     }
     const bodyWidth = Math.max(1, width - 2);
 
-    const header = ` 📨 From: ${senderName} (${this.from.cwd}) `;
+    const header = ` 📨 From: ${senderName} (${senderCwd}) `;
     const headerText = truncateToWidth(this.collapsed ? `${header} Ctrl+O expands ` : header, bodyWidth, "");
     const headerPadding = Math.max(0, bodyWidth - visibleWidth(headerText));
     lines.push(this.theme.fg("accent", `╭${headerText}${borderChar.repeat(headerPadding)}╮`));
@@ -85,7 +90,7 @@ export class InlineMessageComponent implements Component {
     if (this.message.content.attachments?.length) {
       lines.push(this.theme.fg("accent", `│${" ".repeat(bodyWidth)}│`));
       for (const att of this.message.content.attachments) {
-        const label = this.theme.fg("dim", ` 📎 ${att.name}`);
+        const label = this.theme.fg("dim", ` 📎 ${sanitizeDisplayText(att.name, "Unnamed attachment")}`);
         const text = truncateToWidth(label, bodyWidth, "");
         const padding = Math.max(0, bodyWidth - visibleWidth(text));
         lines.push(this.theme.fg("accent", `│${text}${" ".repeat(padding)}│`));

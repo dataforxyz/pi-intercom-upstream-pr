@@ -6,7 +6,7 @@ export const INTERCOM_DIR_MODE = 0o700;
 export const INTERCOM_RUNTIME_FILE_MODE = 0o600;
 export const INTERCOM_TCP_HOST = "127.0.0.1";
 export const INTERCOM_PROTOCOL_NAME = "pi-intercom";
-export const INTERCOM_PROTOCOL_VERSION = 1;
+export const INTERCOM_PROTOCOL_VERSION = 2;
 
 export interface BrokerTcpEndpoint {
   transport: "tcp";
@@ -60,6 +60,10 @@ export function shouldUseWindowsTcpTransport(
 
 export function getBrokerPortFilePath(intercomDir: string = getIntercomDirPath()): string {
   return join(intercomDir, "broker.port.json");
+}
+
+export function getBrokerAskStateFilePath(intercomDir: string = getIntercomDirPath()): string {
+  return join(intercomDir, "broker-asks.json");
 }
 
 export function getBrokerSocketPath(

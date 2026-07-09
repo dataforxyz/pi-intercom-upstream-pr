@@ -5,16 +5,18 @@
   "type": "module",
   "main": "index.ts",
   "files": [
-    "index.ts",
-    "types.ts",
-    "config.ts",
-    "reply-tracker.ts",
+    "banner.png",
+    "*.ts",
+    "!*.test.ts",
     "broker/**/*.ts",
+    "!broker/**/*.test.ts",
     "ui/**/*.ts",
-    "skills/**/*"
+    "skills/**/*",
+    "!**/*.test.ts"
   ],
   "scripts": {
-    "test": "tsx --test broker/client.test.ts broker/framing.test.ts broker/paths.test.ts broker/spawn.test.ts clipboard.test.ts config.test.ts reply-tracker.test.ts intercom.integration.test.ts test/inline-message.test.ts test/overlay-width.test.ts"
+    "test": "tsx --test broker/*.test.ts *.test.ts test/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "pi-package"
@@ -37,9 +39,11 @@
     "tsx": "^4.20.0"
   },
   "devDependencies": {
+    "@types/node": "^22.15.0",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "typebox": "*",
+    "typescript": "^5.9.3"
   }
 }

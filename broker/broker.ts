@@ -1,10 +1,11 @@
 import net from "net";
-import { writeFileSync, unlinkSync } from "fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
 import {
   ensureIntercomRuntimeDir,
+  getBrokerAskStateFilePath,
   getBrokerListenTarget,
   getBrokerPortFilePath,
   getIntercomDirPath,
@@ -15,12 +16,22 @@ import {
   type BrokerConnectTarget,
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
-import type { SessionInfo, Message, Attachment, BrokerMessage, SessionRegistration } from "../types.ts";
+import type {
+  AskCancellationReason,
+  BrokerErrorCode,
+  BrokerMessage,
+  DeliveryFailureCode,
+  Message,
+  Attachment,
+  SessionInfo,
+  SessionRegistration,
+} from "../types.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
 const PID_PATH = join(INTERCOM_DIR, "broker.pid");
 const PORT_PATH = getBrokerPortFilePath(INTERCOM_DIR);
+const ASK_STATE_PATH = getBrokerAskStateFilePath(INTERCOM_DIR);
 const BROKER_STATE_ID = randomUUID();
 const MAX_SESSIONS = 128;
 const MAX_UNREGISTERED_CONNECTIONS = 32;
@@ -28,6 +39,21 @@ const REGISTRATION_TIMEOUT_MS = 1000;
 const RATE_LIMIT_CAPACITY = 240;
 const RATE_LIMIT_REFILL_PER_SECOND = 120;
 const PRESENCE_HEARTBEAT_MS = 1000;
+const DELIVERY_ACK_TIMEOUT_MS = 8000;
+const RECENT_DELIVERY_TTL_MS = 10 * 60 * 1000;
+const MAX_PENDING_DELIVERIES = 1024;
+const MAX_PENDING_DELIVERIES_PER_SESSION = 64;
+const MAX_PENDING_ASKS_PER_SESSION = 64;
+const RATE_LIMIT_BYTES_PER_TOKEN = 8 * 1024;
+const MAX_MESSAGE_TEXT_BYTES = 256 * 1024;
+const MAX_ATTACHMENT_CONTENT_BYTES = 512 * 1024;
+const MAX_ATTACHMENTS = 16;
+const MAX_MESSAGE_ID_LENGTH = 256;
+const MAX_TARGET_LENGTH = 512;
+const MAX_SESSION_NAME_LENGTH = 256;
+const MAX_SESSION_CWD_LENGTH = 4096;
+const MAX_SESSION_MODEL_LENGTH = 512;
+const MAX_SESSION_STATUS_LENGTH = 512;
 
 interface ConnectedSession {
   socket: net.Socket;
@@ -42,9 +68,43 @@ interface ConnectionState {
 }
 
 interface AskEdge {
+  messageId: string;
   from: string;
   to: string;
   createdAt: number;
+  expiresAt: number;
+  state: "blocking" | "deferred";
+  timeout: NodeJS.Timeout;
+}
+
+interface PersistedAskEdge {
+  messageId: string;
+  from: string;
+  to: string;
+  createdAt: number;
+  expiresAt: number;
+  state: "blocking" | "deferred";
+}
+
+interface PendingDelivery {
+  id: string;
+  key: string;
+  fingerprint: string;
+  message: Message;
+  from: string;
+  to: string;
+  senderSocket: net.Socket;
+  recipientSocket: net.Socket;
+  timeout: NodeJS.Timeout;
+}
+
+interface RecentDelivery {
+  fingerprint: string;
+  retryable: boolean;
+  response:
+    | { type: "delivered"; messageId: string; deliveryId: string }
+    | { type: "delivery_failed"; messageId: string; accepted: boolean; code: DeliveryFailureCode; reason: string };
+  expiresAt: number;
 }
 
 function isAttachment(value: unknown): value is Attachment {
@@ -62,7 +122,12 @@ function isAttachment(value: unknown): value is Attachment {
     return false;
   }
 
-  if (typeof attachment.name !== "string" || typeof attachment.content !== "string") {
+  if (
+    typeof attachment.name !== "string"
+    || attachment.name.length > 256
+    || typeof attachment.content !== "string"
+    || Buffer.byteLength(attachment.content, "utf-8") > MAX_ATTACHMENT_CONTENT_BYTES
+  ) {
     return false;
   }
 
@@ -76,11 +141,20 @@ function isMessage(value: unknown): value is Message {
 
   const message = value as Record<string, unknown>;
 
-  if (typeof message.id !== "string" || typeof message.timestamp !== "number") {
+  if (
+    typeof message.id !== "string"
+    || message.id.length === 0
+    || message.id.length > MAX_MESSAGE_ID_LENGTH
+    || typeof message.timestamp !== "number"
+    || !Number.isFinite(message.timestamp)
+  ) {
     return false;
   }
 
-  if (message.replyTo !== undefined && typeof message.replyTo !== "string") {
+  if (
+    message.replyTo !== undefined
+    && (typeof message.replyTo !== "string" || message.replyTo.length === 0 || message.replyTo.length > MAX_MESSAGE_ID_LENGTH)
+  ) {
     return false;
   }
 
@@ -93,12 +167,16 @@ function isMessage(value: unknown): value is Message {
   }
 
   const content = message.content as Record<string, unknown>;
-  if (typeof content.text !== "string") {
+  if (typeof content.text !== "string" || Buffer.byteLength(content.text, "utf-8") > MAX_MESSAGE_TEXT_BYTES) {
     return false;
   }
 
   return content.attachments === undefined
-    || (Array.isArray(content.attachments) && content.attachments.every(isAttachment));
+    || (
+      Array.isArray(content.attachments)
+      && content.attachments.length <= MAX_ATTACHMENTS
+      && content.attachments.every(isAttachment)
+    );
 }
 
 function isSessionId(value: unknown): value is string {
@@ -114,24 +192,35 @@ function isSessionRegistration(value: unknown): value is SessionRegistration {
 
   if (
     typeof session.cwd !== "string"
+    || session.cwd.length === 0
+    || session.cwd.length > MAX_SESSION_CWD_LENGTH
     || typeof session.model !== "string"
+    || session.model.length === 0
+    || session.model.length > MAX_SESSION_MODEL_LENGTH
     || typeof session.pid !== "number"
+    || !Number.isFinite(session.pid)
     || typeof session.startedAt !== "number"
+    || !Number.isFinite(session.startedAt)
     || typeof session.lastActivity !== "number"
+    || !Number.isFinite(session.lastActivity)
   ) {
     return false;
   }
 
-  if (session.name !== undefined && typeof session.name !== "string") {
+  if (session.name !== undefined && (typeof session.name !== "string" || session.name.length > MAX_SESSION_NAME_LENGTH)) {
     return false;
   }
 
-  return session.status === undefined || typeof session.status === "string";
+  return session.status === undefined
+    || (typeof session.status === "string" && session.status.length <= MAX_SESSION_STATUS_LENGTH);
 }
 
 class IntercomBroker {
   private sessions = new Map<string, ConnectedSession>();
   private askEdges = new Map<string, AskEdge>();
+  private pendingDeliveries = new Map<string, PendingDelivery>();
+  private pendingDeliveryKeys = new Map<string, string>();
+  private recentDeliveries = new Map<string, RecentDelivery>();
   private connections = new Set<net.Socket>();
   private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
@@ -140,6 +229,7 @@ class IntercomBroker {
 
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
+    this.loadAskEdges();
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
         unlinkSync(LISTEN_TARGET);
@@ -215,19 +305,30 @@ class IntercomBroker {
     };
 
     const reader = createMessageReader((msg) => {
-      if (!this.consumeToken(connection)) {
-        writeMessage(socket, { type: "error", error: "Intercom broker rate limit exceeded" });
+      const byteCost = Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(msg), "utf-8") / RATE_LIMIT_BYTES_PER_TOKEN));
+      if (!this.consumeToken(connection, byteCost)) {
+        this.sendError(socket, "RATE_LIMITED", "Intercom broker rate limit exceeded");
         socket.destroy(new Error("Intercom broker rate limit exceeded"));
         return;
       }
-      this.handleMessage(socket, msg, sessionId, (id) => {
-        sessionId = id;
-        if (id) {
-          clearRegistrationTimeout();
-        } else {
-          armRegistrationTimeout();
+      try {
+        this.handleMessage(socket, msg, sessionId, (id) => {
+          sessionId = id;
+          if (id) {
+            clearRegistrationTimeout();
+          } else {
+            armRegistrationTimeout();
+          }
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (reason === "Invalid intercom TCP endpoint credentials") {
+          socket.destroy();
+          return;
         }
-      });
+        this.sendError(socket, "INVALID_REQUEST", reason);
+        socket.end();
+      }
     }, (error) => {
       socket.destroy(error);
     });
@@ -241,7 +342,8 @@ class IntercomBroker {
         const existing = this.sessions.get(sessionId);
         if (existing?.socket === socket) {
           this.sessions.delete(sessionId);
-          this.clearAskEdgesForSession(sessionId);
+          this.clearPendingDeliveriesForSession(sessionId, socket);
+          this.deferAskEdgesForSession(sessionId);
           this.broadcast({ type: "session_left", sessionId }, sessionId);
           this.scheduleShutdownCheck();
         }
@@ -267,7 +369,7 @@ class IntercomBroker {
     }
   }
 
-  private consumeToken(connection: ConnectionState, now = Date.now()): boolean {
+  private consumeToken(connection: ConnectionState, cost = 1, now = Date.now()): boolean {
     const elapsedMs = now - connection.lastRefillAt;
     if (elapsedMs > 0) {
       connection.tokens = Math.min(
@@ -276,11 +378,25 @@ class IntercomBroker {
       );
       connection.lastRefillAt = now;
     }
-    if (connection.tokens < 1) {
+    if (connection.tokens < cost) {
       return false;
     }
-    connection.tokens -= 1;
+    connection.tokens -= cost;
     return true;
+  }
+
+  private sendError(socket: net.Socket, code: BrokerErrorCode, error: string): void {
+    writeMessage(socket, { type: "error", code, error });
+  }
+
+  private sendDeliveryFailure(
+    socket: net.Socket,
+    messageId: string,
+    accepted: boolean,
+    code: DeliveryFailureCode,
+    reason: string,
+  ): void {
+    writeMessage(socket, { type: "delivery_failed", messageId, accepted, code, reason });
   }
 
   private scheduleShutdownCheck(): void {
@@ -339,6 +455,19 @@ class IntercomBroker {
           throw new Error("Invalid register message");
         }
 
+        if (
+          clientMessage.protocol !== INTERCOM_PROTOCOL_NAME
+          || clientMessage.version !== INTERCOM_PROTOCOL_VERSION
+        ) {
+          this.sendError(
+            socket,
+            "PROTOCOL_MISMATCH",
+            `Unsupported intercom protocol; expected ${INTERCOM_PROTOCOL_NAME} v${INTERCOM_PROTOCOL_VERSION}`,
+          );
+          socket.end();
+          break;
+        }
+
         if (currentId) {
           throw new Error("Received duplicate register message");
         }
@@ -352,12 +481,13 @@ class IntercomBroker {
         }
         const previous = this.sessions.get(id);
         if (!previous && this.sessions.size >= MAX_SESSIONS) {
-          writeMessage(socket, { type: "error", error: "Too many registered intercom sessions" });
+          this.sendError(socket, "TOO_MANY_SESSIONS", "Too many registered intercom sessions");
           socket.destroy();
           break;
         }
         if (previous) {
-          this.clearAskEdgesForSession(id);
+          this.clearPendingDeliveriesForSession(id, previous.socket);
+          this.deferAskEdgesForSession(id);
           previous.socket.end();
         }
         setId(id);
@@ -380,7 +510,12 @@ class IntercomBroker {
           this.shutdownTimer = null;
         }
 
-        writeMessage(socket, { type: "registered", sessionId: id });
+        writeMessage(socket, {
+          type: "registered",
+          sessionId: id,
+          protocol: INTERCOM_PROTOCOL_NAME,
+          version: INTERCOM_PROTOCOL_VERSION,
+        });
         this.broadcast({ type: "session_joined", session: info }, id);
         break;
       }
@@ -389,10 +524,18 @@ class IntercomBroker {
         if (!currentId) {
           throw new Error("Received unregister before register");
         }
+        if (clientMessage.preserveAsks !== undefined && typeof clientMessage.preserveAsks !== "boolean") {
+          throw new Error("Invalid unregister preserveAsks value");
+        }
         const existing = this.sessions.get(currentId);
         if (existing?.socket === socket) {
           this.sessions.delete(currentId);
-          this.clearAskEdgesForSession(currentId);
+          this.clearPendingDeliveriesForSession(currentId, socket);
+          if (clientMessage.preserveAsks) {
+            this.deferAskEdgesForSession(currentId);
+          } else {
+            this.clearAskEdgesForSession(currentId, "session_disconnected");
+          }
           this.broadcast({ type: "session_left", sessionId: currentId }, currentId);
           this.scheduleShutdownCheck();
         }
@@ -415,86 +558,170 @@ class IntercomBroker {
           throw new Error("Received send before register");
         }
         const message = clientMessage.message;
-        const messageId = isMessage(message) ? message.id : "unknown";
+        const messageId = typeof message === "object"
+          && message !== null
+          && "id" in message
+          && typeof message.id === "string"
+          && message.id.length > 0
+          && message.id.length <= MAX_MESSAGE_ID_LENGTH
+          ? message.id
+          : "unknown";
 
-        if (typeof clientMessage.to !== "string" || !isMessage(message)) {
-          writeMessage(socket, {
-            type: "delivery_failed",
-            messageId,
-            reason: "Invalid message format",
-          });
+        if (
+          typeof clientMessage.to !== "string"
+          || clientMessage.to.length === 0
+          || clientMessage.to.length > MAX_TARGET_LENGTH
+          || !isMessage(message)
+        ) {
+          this.sendDeliveryFailure(socket, messageId, false, "INVALID_MESSAGE", "Invalid message format");
           break;
         }
 
-        this.pruneAskEdges();
-        const replyEdge = message.replyTo ? this.askEdges.get(message.replyTo) : undefined;
+        this.pruneRecentDeliveries();
+        const deliveryKey = this.deliveryKey(currentId, message.id);
+        const fingerprint = JSON.stringify({
+          to: clientMessage.to,
+          replyTo: message.replyTo,
+          expectsReply: message.expectsReply,
+          content: message.content,
+        });
+        const recent = this.recentDeliveries.get(deliveryKey);
+        if (recent) {
+          if (recent.fingerprint !== fingerprint) {
+            this.sendDeliveryFailure(socket, message.id, false, "DUPLICATE_MESSAGE_ID", "Message ID was already used with a different payload");
+            break;
+          }
+          if (recent.retryable) {
+            this.recentDeliveries.delete(deliveryKey);
+          } else {
+            if (recent.response.type === "delivered") {
+              writeMessage(socket, {
+                type: "delivery_accepted",
+                messageId: message.id,
+                deliveryId: recent.response.deliveryId,
+              });
+            }
+            writeMessage(socket, recent.response);
+            break;
+          }
+        }
+        const existingDeliveryId = this.pendingDeliveryKeys.get(deliveryKey);
+        if (existingDeliveryId) {
+          const existing = this.pendingDeliveries.get(existingDeliveryId);
+          if (!existing || existing.fingerprint !== fingerprint) {
+            this.sendDeliveryFailure(socket, message.id, false, "DUPLICATE_MESSAGE_ID", "Message ID is already pending with a different payload");
+          } else {
+            writeMessage(socket, { type: "delivery_accepted", messageId: message.id, deliveryId: existing.id });
+          }
+          break;
+        }
+
+        if (
+          this.pendingDeliveries.size >= MAX_PENDING_DELIVERIES
+          || this.countPendingDeliveriesFrom(currentId) >= MAX_PENDING_DELIVERIES_PER_SESSION
+        ) {
+          this.sendDeliveryFailure(socket, message.id, false, "TOO_MANY_PENDING_DELIVERIES", "Too many messages are waiting for receiver acknowledgement");
+          break;
+        }
 
         const targets = this.findSessions(clientMessage.to);
         if (targets.length === 1) {
-          if (message.replyTo && !replyEdge) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match a pending ask",
-            });
-            break;
-          }
           const fromSession = this.sessions.get(currentId);
           if (!fromSession || fromSession.socket !== socket) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Sender session not found",
-            });
+            this.sendDeliveryFailure(socket, message.id, false, "SENDER_NOT_FOUND", "Sender session not found");
             break;
           }
           const target = targets[0];
+          const replyEdge = message.replyTo
+            ? this.askEdges.get(this.askKey(target.info.id, message.replyTo))
+            : undefined;
+          if (message.replyTo && !replyEdge) {
+            this.sendDeliveryFailure(socket, message.id, false, "INVALID_REPLY_TARGET", "Reply target does not match a pending ask");
+            break;
+          }
           if (replyEdge && (replyEdge.to !== currentId || replyEdge.from !== target.info.id)) {
-            writeMessage(socket, {
-              type: "delivery_failed",
-              messageId: message.id,
-              reason: "Reply target does not match the pending ask",
-            });
+            this.sendDeliveryFailure(socket, message.id, false, "INVALID_REPLY_TARGET", "Reply target does not match the pending ask");
             break;
           }
           if (message.expectsReply) {
-            const reverseEdge = Array.from(this.askEdges.entries()).find(([edgeMessageId, edge]) => edgeMessageId !== message.replyTo && edge.from === target.info.id && edge.to === currentId);
+            const reverseEdge = Array.from(this.askEdges.values()).find((edge) =>
+              edge.state === "blocking"
+              && !(message.replyTo === edge.messageId && target.info.id === edge.from)
+              && edge.from === target.info.id
+              && edge.to === currentId
+            );
             if (reverseEdge) {
-              writeMessage(socket, {
-                type: "delivery_failed",
-                messageId: message.id,
-                reason: "Mutual ask refused: target session is already waiting for a reply from this session.",
-              });
+              this.sendDeliveryFailure(socket, message.id, false, "MUTUAL_ASK", "Mutual ask refused: target session is already waiting for a reply from this session.");
               break;
             }
-            this.askEdges.set(message.id, { from: currentId, to: target.info.id, createdAt: Date.now() });
+            if (this.countAskEdgesFrom(currentId) >= MAX_PENDING_ASKS_PER_SESSION) {
+              this.sendDeliveryFailure(socket, message.id, false, "TOO_MANY_PENDING_ASKS", "Too many asks are already waiting for replies");
+              break;
+            }
+            this.addAskEdge(message.id, currentId, target.info.id);
           }
+
+          const deliveryId = randomUUID();
+          const timeout = setTimeout(() => {
+            this.failPendingDelivery(deliveryId, "DELIVERY_TIMEOUT", "Recipient did not acknowledge the message in time");
+          }, DELIVERY_ACK_TIMEOUT_MS);
+          timeout.unref?.();
+          const pending: PendingDelivery = {
+            id: deliveryId,
+            key: deliveryKey,
+            fingerprint,
+            message,
+            from: currentId,
+            to: target.info.id,
+            senderSocket: socket,
+            recipientSocket: target.socket,
+            timeout,
+          };
+          this.pendingDeliveries.set(deliveryId, pending);
+          this.pendingDeliveryKeys.set(deliveryKey, deliveryId);
+          writeMessage(socket, { type: "delivery_accepted", messageId: message.id, deliveryId });
           writeMessage(target.socket, {
             type: "message",
+            deliveryId,
             from: fromSession.info,
             message,
           });
-          if (message.replyTo) {
-            this.askEdges.delete(message.replyTo);
-          }
-          writeMessage(socket, { type: "delivered", messageId: message.id });
           break;
         }
 
         if (targets.length > 1) {
-          writeMessage(socket, {
-            type: "delivery_failed",
-            messageId: message.id,
-            reason: `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`,
-          });
+          this.sendDeliveryFailure(socket, message.id, false, "AMBIGUOUS_TARGET", `Multiple sessions named \"${clientMessage.to}\" are connected. Use the session ID instead.`);
           break;
         }
 
-        writeMessage(socket, {
-          type: "delivery_failed",
-          messageId: message.id,
-          reason: "Session not found",
-        });
+        this.sendDeliveryFailure(socket, message.id, false, "SESSION_NOT_FOUND", "Session not found");
+        break;
+      }
+
+      case "message_received": {
+        if (!currentId) {
+          throw new Error("Received message_received before register");
+        }
+        if (typeof clientMessage.deliveryId !== "string") {
+          throw new Error("Invalid message_received message");
+        }
+        this.acknowledgePendingDelivery(clientMessage.deliveryId, currentId, socket);
+        break;
+      }
+
+      case "defer_ask": {
+        if (!currentId) {
+          throw new Error("Received defer_ask before register");
+        }
+        if (typeof clientMessage.messageId !== "string") {
+          throw new Error("Invalid defer_ask message");
+        }
+        const edge = this.askEdges.get(this.askKey(currentId, clientMessage.messageId));
+        if (edge?.from === currentId && edge.state === "blocking") {
+          edge.state = "deferred";
+          this.persistAskEdges();
+          this.notifyAskDeferred(edge);
+        }
         break;
       }
 
@@ -506,9 +733,10 @@ class IntercomBroker {
           throw new Error("Invalid cancel_ask message");
         }
         const session = this.sessions.get(currentId);
-        const edge = this.askEdges.get(clientMessage.messageId);
+        const edgeKey = this.askKey(currentId, clientMessage.messageId);
+        const edge = this.askEdges.get(edgeKey);
         if (session?.socket === socket && edge?.from === currentId) {
-          this.askEdges.delete(clientMessage.messageId);
+          this.removeAskEdge(edgeKey, "cancelled", true);
         }
         break;
       }
@@ -521,7 +749,7 @@ class IntercomBroker {
         if (session?.socket === socket) {
           let changed = false;
           if (clientMessage.name !== undefined) {
-            if (typeof clientMessage.name !== "string") {
+            if (typeof clientMessage.name !== "string" || clientMessage.name.length > MAX_SESSION_NAME_LENGTH) {
               throw new Error("Invalid presence name");
             }
             if (session.info.name !== clientMessage.name) {
@@ -530,7 +758,7 @@ class IntercomBroker {
             }
           }
           if (clientMessage.status !== undefined) {
-            if (typeof clientMessage.status !== "string") {
+            if (typeof clientMessage.status !== "string" || clientMessage.status.length > MAX_SESSION_STATUS_LENGTH) {
               throw new Error("Invalid presence status");
             }
             if (session.info.status !== clientMessage.status) {
@@ -539,7 +767,7 @@ class IntercomBroker {
             }
           }
           if (clientMessage.model !== undefined) {
-            if (typeof clientMessage.model !== "string") {
+            if (typeof clientMessage.model !== "string" || clientMessage.model.length > MAX_SESSION_MODEL_LENGTH) {
               throw new Error("Invalid presence model");
             }
             if (session.info.model !== clientMessage.model) {
@@ -562,18 +790,311 @@ class IntercomBroker {
     }
   }
 
-  private pruneAskEdges(now = Date.now()): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (now - edge.createdAt > this.askTimeoutMs) {
-        this.askEdges.delete(messageId);
+  private askKey(fromSessionId: string, messageId: string): string {
+    return `${fromSessionId}\u0000${messageId}`;
+  }
+
+  private deliveryKey(fromSessionId: string, messageId: string): string {
+    return `${fromSessionId}\u0000${messageId}`;
+  }
+
+  private addAskEdge(messageId: string, from: string, to: string): void {
+    const key = this.askKey(from, messageId);
+    const previous = this.askEdges.get(key);
+    if (previous) {
+      clearTimeout(previous.timeout);
+    }
+    const createdAt = Date.now();
+    const expiresAt = createdAt + this.askTimeoutMs;
+    this.askEdges.set(key, {
+      messageId,
+      from,
+      to,
+      createdAt,
+      expiresAt,
+      state: "blocking",
+      timeout: this.scheduleAskExpiry(key, expiresAt),
+    });
+    this.persistAskEdges();
+  }
+
+  private removeAskEdge(key: string, reason?: AskCancellationReason, notifyRecipient = false): void {
+    const edge = this.askEdges.get(key);
+    if (!edge) {
+      return;
+    }
+    clearTimeout(edge.timeout);
+    this.askEdges.delete(key);
+    this.persistAskEdges();
+    if (reason && notifyRecipient) {
+      this.notifyAskCancelled(edge.to, edge.messageId, edge.from, reason);
+    }
+  }
+
+  private notifyAskDeferred(edge: AskEdge): void {
+    const recipient = this.sessions.get(edge.to);
+    if (recipient) {
+      writeMessage(recipient.socket, {
+        type: "ask_deferred",
+        messageId: edge.messageId,
+        fromSessionId: edge.from,
+      });
+    }
+  }
+
+  private notifyAskCancelled(
+    sessionId: string,
+    messageId: string,
+    fromSessionId: string,
+    reason: AskCancellationReason,
+  ): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      writeMessage(session.socket, { type: "ask_cancelled", messageId, fromSessionId, reason });
+    }
+  }
+
+  private clearAskEdgesForSession(sessionId: string, reason: AskCancellationReason): void {
+    let changed = false;
+    for (const [key, edge] of this.askEdges) {
+      if (edge.from === sessionId || edge.to === sessionId) {
+        clearTimeout(edge.timeout);
+        this.askEdges.delete(key);
+        changed = true;
+        if (edge.from === sessionId) {
+          this.notifyAskCancelled(edge.to, edge.messageId, edge.from, reason);
+        } else {
+          this.notifyAskCancelled(edge.from, edge.messageId, edge.to, reason);
+        }
+      }
+    }
+    if (changed) {
+      this.persistAskEdges();
+    }
+  }
+
+  private deferAskEdgesForSession(sessionId: string): void {
+    let changed = false;
+    for (const edge of this.askEdges.values()) {
+      if ((edge.from === sessionId || edge.to === sessionId) && edge.state === "blocking") {
+        edge.state = "deferred";
+        changed = true;
+        if (edge.from === sessionId) {
+          this.notifyAskDeferred(edge);
+        }
+      }
+    }
+    if (changed) {
+      this.persistAskEdges();
+    }
+  }
+
+  private scheduleAskExpiry(key: string, expiresAt: number): NodeJS.Timeout {
+    const delay = Math.max(1, Math.min(expiresAt - Date.now(), 2_147_483_647));
+    const timeout = setTimeout(() => {
+      if (expiresAt > Date.now()) {
+        const edge = this.askEdges.get(key);
+        if (edge) {
+          clearTimeout(edge.timeout);
+          edge.timeout = this.scheduleAskExpiry(key, expiresAt);
+        }
+        return;
+      }
+      this.removeAskEdge(key, "expired", true);
+    }, delay);
+    timeout.unref?.();
+    return timeout;
+  }
+
+  private loadAskEdges(): void {
+    if (!existsSync(ASK_STATE_PATH)) {
+      return;
+    }
+
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(ASK_STATE_PATH, "utf-8"));
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("expected an object");
+      }
+      const state = parsed as Record<string, unknown>;
+      if (state.version !== 1) {
+        throw new Error("unsupported state version");
+      }
+      const edges = state.edges;
+      if (!Array.isArray(edges)) {
+        throw new Error("expected an edges array");
+      }
+
+      const now = Date.now();
+      for (const candidate of edges) {
+        if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+          continue;
+        }
+        const edge = candidate as Record<string, unknown>;
+        if (
+          typeof edge.messageId !== "string"
+          || edge.messageId.length === 0
+          || edge.messageId.length > MAX_MESSAGE_ID_LENGTH
+          || !isSessionId(edge.from)
+          || !isSessionId(edge.to)
+          || typeof edge.createdAt !== "number"
+          || !Number.isFinite(edge.createdAt)
+          || typeof edge.expiresAt !== "number"
+          || !Number.isFinite(edge.expiresAt)
+          || edge.expiresAt <= now
+          || (edge.state !== "blocking" && edge.state !== "deferred")
+        ) {
+          continue;
+        }
+
+        const key = this.askKey(edge.from, edge.messageId);
+        this.askEdges.set(key, {
+          messageId: edge.messageId,
+          from: edge.from,
+          to: edge.to,
+          createdAt: edge.createdAt,
+          expiresAt: edge.expiresAt,
+          state: "deferred",
+          timeout: this.scheduleAskExpiry(key, edge.expiresAt),
+        });
+      }
+      this.persistAskEdges();
+    } catch (error) {
+      console.error(`Failed to load persisted ask state at ${ASK_STATE_PATH}:`, error);
+      for (const edge of this.askEdges.values()) {
+        clearTimeout(edge.timeout);
+      }
+      this.askEdges.clear();
+      try {
+        const corruptPath = `${ASK_STATE_PATH}.corrupt-${Date.now()}`;
+        renameSync(ASK_STATE_PATH, corruptPath);
+        restrictIntercomRuntimeFile(corruptPath);
+      } catch {
+        // Keep running with empty state even if the corrupt file cannot be moved.
       }
     }
   }
 
-  private clearAskEdgesForSession(sessionId: string): void {
-    for (const [messageId, edge] of this.askEdges) {
-      if (edge.from === sessionId || edge.to === sessionId) {
-        this.askEdges.delete(messageId);
+  private persistAskEdges(): void {
+    const edges: PersistedAskEdge[] = Array.from(this.askEdges.values(), (edge) => ({
+      messageId: edge.messageId,
+      from: edge.from,
+      to: edge.to,
+      createdAt: edge.createdAt,
+      expiresAt: edge.expiresAt,
+      state: edge.state,
+    }));
+    const temporaryPath = `${ASK_STATE_PATH}.${process.pid}.tmp`;
+    writeFileSync(temporaryPath, `${JSON.stringify({ version: 1, edges })}\n`, { mode: INTERCOM_RUNTIME_FILE_MODE });
+    restrictIntercomRuntimeFile(temporaryPath);
+    const fileDescriptor = openSync(temporaryPath, "r");
+    try {
+      fsyncSync(fileDescriptor);
+    } finally {
+      closeSync(fileDescriptor);
+    }
+    renameSync(temporaryPath, ASK_STATE_PATH);
+    restrictIntercomRuntimeFile(ASK_STATE_PATH);
+    if (process.platform !== "win32") {
+      const directoryDescriptor = openSync(INTERCOM_DIR, "r");
+      try {
+        fsyncSync(directoryDescriptor);
+      } finally {
+        closeSync(directoryDescriptor);
+      }
+    }
+  }
+
+  private countAskEdgesFrom(sessionId: string): number {
+    let count = 0;
+    for (const edge of this.askEdges.values()) {
+      if (edge.from === sessionId) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  private countPendingDeliveriesFrom(sessionId: string): number {
+    let count = 0;
+    for (const delivery of this.pendingDeliveries.values()) {
+      if (delivery.from === sessionId) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  private acknowledgePendingDelivery(deliveryId: string, sessionId: string, socket: net.Socket): void {
+    const pending = this.pendingDeliveries.get(deliveryId);
+    if (!pending || pending.to !== sessionId || pending.recipientSocket !== socket) {
+      return;
+    }
+
+    clearTimeout(pending.timeout);
+    this.pendingDeliveries.delete(deliveryId);
+    this.pendingDeliveryKeys.delete(pending.key);
+    if (pending.message.replyTo) {
+      this.removeAskEdge(this.askKey(pending.to, pending.message.replyTo));
+    }
+    const response = { type: "delivered" as const, messageId: pending.message.id, deliveryId };
+    this.recentDeliveries.set(pending.key, {
+      fingerprint: pending.fingerprint,
+      retryable: false,
+      response,
+      expiresAt: Date.now() + RECENT_DELIVERY_TTL_MS,
+    });
+    const sender = this.sessions.get(pending.from);
+    if (sender?.socket === pending.senderSocket) {
+      writeMessage(sender.socket, response);
+    }
+  }
+
+  private failPendingDelivery(deliveryId: string, code: DeliveryFailureCode, reason: string): void {
+    const pending = this.pendingDeliveries.get(deliveryId);
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timeout);
+    this.pendingDeliveries.delete(deliveryId);
+    this.pendingDeliveryKeys.delete(pending.key);
+    if (pending.message.expectsReply) {
+      this.removeAskEdge(this.askKey(pending.from, pending.message.id), "delivery_failed", true);
+    }
+    const response = {
+      type: "delivery_failed" as const,
+      messageId: pending.message.id,
+      accepted: true,
+      code,
+      reason,
+    };
+    this.recentDeliveries.set(pending.key, {
+      fingerprint: pending.fingerprint,
+      retryable: true,
+      response,
+      expiresAt: Date.now() + RECENT_DELIVERY_TTL_MS,
+    });
+    const sender = this.sessions.get(pending.from);
+    if (sender?.socket === pending.senderSocket) {
+      writeMessage(sender.socket, response);
+    }
+  }
+
+  private clearPendingDeliveriesForSession(sessionId: string, socket: net.Socket): void {
+    for (const delivery of Array.from(this.pendingDeliveries.values())) {
+      if (delivery.to === sessionId && delivery.recipientSocket === socket) {
+        this.failPendingDelivery(delivery.id, "RECIPIENT_DISCONNECTED", "Recipient disconnected before acknowledging the message");
+      } else if (delivery.from === sessionId && delivery.senderSocket === socket) {
+        this.failPendingDelivery(delivery.id, "SENDER_DISCONNECTED", "Sender disconnected before delivery was acknowledged");
+      }
+    }
+  }
+
+  private pruneRecentDeliveries(now = Date.now()): void {
+    for (const [key, delivery] of this.recentDeliveries) {
+      if (delivery.expiresAt <= now) {
+        this.recentDeliveries.delete(key);
       }
     }
   }
@@ -610,6 +1131,14 @@ class IntercomBroker {
       session.socket.end();
     }
     this.sessions.clear();
+    for (const delivery of this.pendingDeliveries.values()) {
+      clearTimeout(delivery.timeout);
+    }
+    this.pendingDeliveries.clear();
+    this.pendingDeliveryKeys.clear();
+    for (const edge of this.askEdges.values()) {
+      clearTimeout(edge.timeout);
+    }
     this.askEdges.clear();
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {

@@ -2,6 +2,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import type { SessionInfo } from "../types.ts";
+import { sanitizeDisplayText, searchableSessionText, shortestUniqueIdPrefixes } from "./session-identity.ts";
 
 function middleTruncate(text: string, maxWidth: number): string {
   if (visibleWidth(text) <= maxWidth) {
@@ -29,16 +30,16 @@ function middleTruncate(text: string, maxWidth: number): string {
   return truncateToWidth(`${left}…${right}`, maxWidth, "");
 }
 
-function shortSessionId(sessionId: string): string {
-  return sessionId.slice(0, 8);
-}
-
-function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?: boolean }): string {
-  const name = session.name || "Unnamed session";
+function sessionTitle(
+  session: SessionInfo,
+  idPrefix: string,
+  options?: { self?: boolean; sameCwd?: boolean },
+): string {
+  const name = sanitizeDisplayText(session.name, "Unnamed session");
   const tags = [options?.self ? "self" : undefined, options?.sameCwd ? "same cwd" : undefined]
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
-  return `${name} (${shortSessionId(session.id)})${suffix}`;
+  return `${name} (${sanitizeDisplayText(idPrefix, "unknown")})${suffix}`;
 }
 
 export class SessionListOverlay implements Component {
@@ -49,6 +50,8 @@ export class SessionListOverlay implements Component {
   private sessions: SessionInfo[];
   private selectedIndex = 0;
   private maxVisible = 8;
+  private query = "";
+  private idPrefixes: Map<string, string>;
 
   constructor(
     theme: Theme,
@@ -62,10 +65,17 @@ export class SessionListOverlay implements Component {
     this.currentSession = currentSession;
     this.sessions = sessions;
     this.done = done;
+    this.idPrefixes = shortestUniqueIdPrefixes([currentSession.id, ...sessions.map(session => session.id)]);
   }
 
-  private onSessionSelect(sessionId: string): void {
-    const session = this.sessions.find(s => s.id === sessionId);
+  private get filteredSessions(): SessionInfo[] {
+    const query = this.query.trim().toLocaleLowerCase();
+    if (!query) return this.sessions;
+    return this.sessions.filter(session => searchableSessionText(session).includes(query));
+  }
+
+  private onSessionSelect(sessionId: string, sessions: SessionInfo[]): void {
+    const session = sessions.find(s => s.id === sessionId);
     if (!session) return;
     this.done(session);
   }
@@ -78,24 +88,42 @@ export class SessionListOverlay implements Component {
       return;
     }
 
-    if (this.sessions.length === 0) {
-      return;
-    }
+    const sessions = this.filteredSessions;
 
     if (this.keybindings.matches(data, "tui.select.up")) {
-      this.selectedIndex = this.selectedIndex === 0 ? this.sessions.length - 1 : this.selectedIndex - 1;
+      if (sessions.length === 0) return;
+      this.selectedIndex = this.selectedIndex === 0 ? sessions.length - 1 : this.selectedIndex - 1;
       return;
     }
 
     if (this.keybindings.matches(data, "tui.select.down")) {
-      this.selectedIndex = this.selectedIndex === this.sessions.length - 1 ? 0 : this.selectedIndex + 1;
+      if (sessions.length === 0) return;
+      this.selectedIndex = this.selectedIndex === sessions.length - 1 ? 0 : this.selectedIndex + 1;
       return;
     }
 
     if (this.keybindings.matches(data, "tui.select.confirm")) {
-      const session = this.sessions[this.selectedIndex];
+      const session = sessions[this.selectedIndex];
       if (session) {
-        this.onSessionSelect(session.id);
+        this.onSessionSelect(session.id, sessions);
+      }
+      return;
+    }
+
+    if (this.keybindings.matches(data, "tui.editor.deleteCharBackward")) {
+      this.query = [...this.query].slice(0, -1).join("");
+      this.selectedIndex = 0;
+      return;
+    }
+
+    if (!data.startsWith("\x1b")) {
+      const printable = [...data].filter(character => {
+        const code = character.charCodeAt(0);
+        return code >= 32 && code !== 127 && !(code >= 128 && code <= 159);
+      }).join("");
+      if (printable) {
+        this.query += printable;
+        this.selectedIndex = 0;
       }
     }
   }
@@ -107,7 +135,7 @@ export class SessionListOverlay implements Component {
     }
 
     const contentWidth = Math.max(0, innerWidth - 2);
-    const footer = `${this.keybindings.getKeys("tui.select.confirm").join("/")}: Message • ${this.keybindings.getKeys("tui.select.cancel").join("/")}: Close`;
+    const footer = `Type: Filter • ${this.keybindings.getKeys("tui.select.confirm").join("/")}: Message • ${this.keybindings.getKeys("tui.select.cancel").join("/")}: Close`;
     const border = (text: string) => this.theme.fg("accent", text);
     const row = (text = "") => {
       const clipped = truncateToWidth(text, contentWidth, "", true);
@@ -115,33 +143,44 @@ export class SessionListOverlay implements Component {
     };
 
     const lines: string[] = [];
+    const sessions = this.filteredSessions;
+    if (this.selectedIndex >= sessions.length) this.selectedIndex = Math.max(0, sessions.length - 1);
+    const currentIdPrefix = this.idPrefixes.get(this.currentSession.id) ?? this.currentSession.id;
+    const currentCwd = sanitizeDisplayText(this.currentSession.cwd, "Unknown path");
+    const currentModel = sanitizeDisplayText(this.currentSession.model, "Unknown model");
     lines.push(border(`╭${"─".repeat(contentWidth)}╮`));
     lines.push(row(this.theme.bold(" Current Session")));
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
     lines.push(row());
-    lines.push(row(`  ${this.theme.fg("dim", sessionTitle(this.currentSession, { self: true }))}`));
-    lines.push(row(`  ${this.theme.fg("dim", `${middleTruncate(this.currentSession.cwd, Math.max(8, contentWidth - 4))} • ${this.currentSession.model}`)}`));
+    lines.push(row(`  ${this.theme.fg("dim", sessionTitle(this.currentSession, currentIdPrefix, { self: true }))}`));
+    lines.push(row(`  ${this.theme.fg("dim", `${middleTruncate(currentCwd, Math.max(8, contentWidth - 4))} • ${currentModel}`)}`));
     lines.push(row());
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
     lines.push(row(this.theme.bold(" Other Sessions")));
+    lines.push(row(this.theme.fg("dim", ` Search: ${sanitizeDisplayText(this.query)}█`)));
     lines.push(row());
 
-    if (this.sessions.length === 0) {
-      lines.push(row(this.theme.fg("dim", " No other intercom-connected sessions")));
+    if (sessions.length === 0) {
+      lines.push(row(this.theme.fg("dim", this.sessions.length === 0
+        ? " No other intercom-connected sessions"
+        : ` No sessions match “${sanitizeDisplayText(this.query)}”`)));
     } else {
       const startIndex = Math.max(
         0,
-        Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.sessions.length - this.maxVisible),
+        Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), sessions.length - this.maxVisible),
       );
-      const endIndex = Math.min(startIndex + this.maxVisible, this.sessions.length);
+      const endIndex = Math.min(startIndex + this.maxVisible, sessions.length);
 
       for (let index = startIndex; index < endIndex; index += 1) {
-        const session = this.sessions[index];
+        const session = sessions[index];
         const isSelected = index === this.selectedIndex;
         const sameCwd = session.cwd === this.currentSession.cwd;
         const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
-        const title = sessionTitle(session, { sameCwd });
-        const pathText = `${middleTruncate(session.cwd, Math.max(8, contentWidth - 4))} • ${session.model}`;
+        const idPrefix = this.idPrefixes.get(session.id) ?? session.id;
+        const title = sessionTitle(session, idPrefix, { sameCwd });
+        const cwd = sanitizeDisplayText(session.cwd, "Unknown path");
+        const model = sanitizeDisplayText(session.model, "Unknown model");
+        const pathText = `${middleTruncate(cwd, Math.max(8, contentWidth - 4))} • ${model}`;
 
         lines.push(row(`${prefix}${isSelected ? this.theme.fg("accent", title) : title}`));
         lines.push(row(`  ${this.theme.fg("dim", pathText)}`));
@@ -150,9 +189,9 @@ export class SessionListOverlay implements Component {
         }
       }
 
-      if (startIndex > 0 || endIndex < this.sessions.length) {
+      if (startIndex > 0 || endIndex < sessions.length) {
         lines.push(row());
-        lines.push(row(this.theme.fg("dim", ` ${this.selectedIndex + 1}/${this.sessions.length}`)));
+        lines.push(row(this.theme.fg("dim", ` ${this.selectedIndex + 1}/${sessions.length}`)));
       }
     }
 

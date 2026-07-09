@@ -7,6 +7,7 @@ import {
   ensureIntercomRuntimeDir,
   getAgentDirPath,
   getBrokerConnectTarget,
+  getBrokerAskStateFilePath,
   getBrokerListenTarget,
   getBrokerPortFilePath,
   getBrokerSocketPath,
@@ -35,6 +36,7 @@ test("getAgentDirPath resolves relative PI_CODING_AGENT_DIR values from the call
 
 test("getIntercomDirPath points at the intercom runtime directory under the agent dir", () => {
   assert.equal(getIntercomDirPath("/tmp/pi-agent"), join("/tmp/pi-agent", "intercom"));
+  assert.equal(getBrokerAskStateFilePath("/tmp/pi-agent/intercom"), join("/tmp/pi-agent/intercom", "broker-asks.json"));
 });
 
 test("getBrokerSocketPath uses named pipe on Windows", () => {

@@ -5,6 +5,7 @@ export interface IntercomContext {
   from: SessionInfo;
   message: Message;
   receivedAt: number;
+  deferredAt?: number;
 }
 
 function matchesPendingSender(context: IntercomContext, to: string): boolean {
@@ -17,13 +18,19 @@ function matchesPendingSender(context: IntercomContext, to: string): boolean {
 
 export class ReplyTracker {
   private readonly pendingAsks = new Map<string, IntercomContext>();
-  private readonly pendingTurnContexts: IntercomContext[] = [];
-  private currentTurnContext: IntercomContext | null = null;
+  private readonly pendingTurnContexts: IntercomContext[][] = [];
+  private currentTurnContexts: IntercomContext[] = [];
 
   constructor(private readonly askTimeoutMs = getAskTimeoutMs()) {}
 
   recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now()): IntercomContext {
-    const context = { from, message, receivedAt };
+    const existing = this.pendingAsks.get(message.id);
+    const context = {
+      from,
+      message,
+      receivedAt,
+      ...(existing?.deferredAt === undefined ? {} : { deferredAt: existing.deferredAt }),
+    };
     if (message.expectsReply) {
       this.pendingAsks.set(message.id, context);
     }
@@ -31,22 +38,28 @@ export class ReplyTracker {
   }
 
   queueTurnContext(context: IntercomContext): void {
-    this.pendingTurnContexts.push(context);
+    this.queueTurnContexts([context]);
+  }
+
+  queueTurnContexts(contexts: readonly IntercomContext[]): void {
+    if (contexts.length > 0) {
+      this.pendingTurnContexts.push([...contexts]);
+    }
   }
 
   beginTurn(now = Date.now()): void {
     this.pruneExpired(now);
-    this.currentTurnContext = this.pendingTurnContexts.shift() ?? null;
+    this.currentTurnContexts = this.pendingTurnContexts.shift() ?? [];
   }
 
   endTurn(): void {
-    this.currentTurnContext = null;
+    this.currentTurnContexts = [];
   }
 
   reset(): void {
     this.pendingAsks.clear();
     this.pendingTurnContexts.length = 0;
-    this.currentTurnContext = null;
+    this.currentTurnContexts = [];
   }
 
   resolveReplyTarget(options: { to?: string; replyTo?: string }, now = Date.now()): IntercomContext {
@@ -63,8 +76,23 @@ export class ReplyTracker {
       return target;
     }
 
-    if (this.currentTurnContext) {
-      return this.currentTurnContext;
+    if (this.currentTurnContexts.length > 0) {
+      const turnMatches = options.to
+        ? this.currentTurnContexts.filter((context) => matchesPendingSender(context, options.to!))
+        : this.currentTurnContexts;
+      const replyableMatches = turnMatches.filter((context) => context.message.expectsReply);
+      if (replyableMatches.length === 1) {
+        return replyableMatches[0]!;
+      }
+      if (replyableMatches.length > 1) {
+        throw new Error("Multiple asks are active in this intercom batch — specify `replyTo`");
+      }
+      if (turnMatches.length === 1) {
+        return turnMatches[0]!;
+      }
+      if (turnMatches.length > 1) {
+        throw new Error("Multiple messages are active in this intercom batch — specify `replyTo`");
+      }
     }
 
     const pending = Array.from(this.pendingAsks.values());
@@ -78,7 +106,7 @@ export class ReplyTracker {
         return matches[0]!;
       }
       if (matches.length > 1) {
-        throw new Error(`Multiple pending asks from \"${options.to}\" — use the sender session ID instead.`);
+        throw new Error(`Multiple pending asks from \"${options.to}\" — specify \`replyTo\` using a message ID from \`pending\`.`);
       }
       if (pending.length > 1) {
         throw new Error(`No pending ask from \"${options.to}\"`);
@@ -89,23 +117,32 @@ export class ReplyTracker {
       throw new Error("No active intercom context to reply to");
     }
 
-    throw new Error("Multiple pending asks — specify `to`");
+    throw new Error("Multiple pending asks — specify `replyTo` using a message ID from `pending`");
   }
 
   markReplied(replyTo: string): void {
     this.dismissPendingAsk(replyTo);
   }
 
+  markDeferred(replyTo: string, deferredAt = Date.now()): boolean {
+    const context = this.pendingAsks.get(replyTo);
+    if (!context) return false;
+    context.deferredAt = deferredAt;
+    return true;
+  }
+
   dismissPendingAsk(replyTo: string): void {
     this.pendingAsks.delete(replyTo);
-    for (let index = this.pendingTurnContexts.length - 1; index >= 0; index -= 1) {
-      if (this.pendingTurnContexts[index]?.message.id === replyTo) {
-        this.pendingTurnContexts.splice(index, 1);
+    for (let batchIndex = this.pendingTurnContexts.length - 1; batchIndex >= 0; batchIndex -= 1) {
+      const batch = this.pendingTurnContexts[batchIndex]!;
+      for (let contextIndex = batch.length - 1; contextIndex >= 0; contextIndex -= 1) {
+        if (batch[contextIndex]?.message.id === replyTo) {
+          batch.splice(contextIndex, 1);
+        }
       }
+      if (batch.length === 0) this.pendingTurnContexts.splice(batchIndex, 1);
     }
-    if (this.currentTurnContext?.message.id === replyTo) {
-      this.currentTurnContext = null;
-    }
+    this.currentTurnContexts = this.currentTurnContexts.filter((context) => context.message.id !== replyTo);
   }
 
   listPending(now = Date.now()): IntercomContext[] {

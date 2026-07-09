@@ -45,26 +45,41 @@ intercom({
 })
 ```
 
-**Worker asks for clarification** (blocks until answer):
+**Worker asks for clarification** (waits briefly, then continues asynchronously if needed):
 ```typescript
 intercom({
   action: "ask",
   to: "planner",
   message: "Should I use exponential backoff or fixed intervals?"
 })
-// → Returns the planner's reply as the result
+// → Returns a prompt reply as the result
+// → After 30 seconds, returns control; a late reply arrives as a new intercom message
 ```
 
 **Worker reports completion**:
 ```typescript
 intercom({
-  action: "ask",
+  action: "send",
   to: "planner",
-  message: "Task-3 complete. Added exponential backoff (100ms → 1600ms, max 5 retries). Ready for task-4?"
+  message: "Task-3 complete. Added exponential backoff (100ms → 1600ms, max 5 retries)."
 })
 ```
 
-### Pattern 2: Quick Status Check
+Use `ask` only when the next step genuinely depends on an answer. Completion and progress notifications should normally use `send` so they do not create an unnecessary wait edge.
+
+### Pattern 2: Send Related Updates as a Burst
+
+The receiver durably queues every message and combines messages that arrive within a 300 ms quiet window into one model turn (never waiting more than 1 second). This means several independently produced updates can be sent promptly without waking the recipient once per message:
+
+```typescript
+intercom({ action: "send", to: "planner", message: "Tests pass." })
+intercom({ action: "send", to: "planner", message: "One API compatibility concern remains." })
+intercom({ action: "send", to: "planner", message: "See src/client.ts:88." })
+```
+
+Do not add artificial sleeps to form a batch. Each original message keeps its sender, ID, attachments, timestamp, and reply context.
+
+### Pattern 3: Quick Status Check
 
 Before sending, verify who's connected:
 
@@ -73,7 +88,7 @@ intercom({ action: "list" })
 // → Shows all connected sessions with names, cwd, models, and live status (`idle`, `thinking`, `tool:<name>`)
 ```
 
-### Pattern 3: Reply Naturally
+### Pattern 4: Reply Naturally
 
 When responding to an inbound ask, prefer `reply` instead of reconstructing raw IDs:
 
@@ -91,7 +106,7 @@ intercom({ action: "reply", to: "planner", message: "Use exponential backoff sta
 
 `reply` still preserves exact threading under the hood by sending the response with the original `replyTo` value.
 
-### Pattern 4: Broadcast to Multiple Workers
+### Pattern 5: Broadcast to Multiple Workers
 
 Send to multiple sessions in parallel:
 
@@ -105,7 +120,7 @@ workers.forEach(w =>
 );
 ```
 
-### Pattern 5: Send with Attachments
+### Pattern 6: Send with Attachments
 
 Share code snippets, files, or context:
 
@@ -126,7 +141,7 @@ intercom({
 })
 ```
 
-### Pattern 6: Handle Subagent Escalations (Orchestrator Side)
+### Pattern 7: Handle Subagent Escalations (Orchestrator Side)
 
 When `pi-subagents` spawns a delegated child and supplies child bridge metadata,
 that child can reach you through `contact_supervisor`. You receive a formatted
@@ -156,8 +171,8 @@ This works because `reply` resolves the correct sender and message ID automatica
 
 | Type | What it means | How to respond |
 |------|---------------|----------------|
-| `need_decision` | Subagent is blocked and waiting for your answer. Has a 10-minute timeout. | Reply promptly with a clear decision. If you need more context, ask follow-up questions via `reply`. |
-| `interview_request` | Subagent needs multiple structured answers in one blocking exchange. Has a 10-minute timeout. | Reply with plain JSON or a fenced `json` block using the provided `{ "responses": [...] }` shape. |
+| `need_decision` | Subagent waits up to 30 seconds, then continues asynchronously while the request remains open. | Reply promptly with a clear decision. If you need more context, ask follow-up questions via `reply`. |
+| `interview_request` | Subagent waits up to 30 seconds for structured answers, then continues asynchronously. | Reply with plain JSON or a fenced `json` block using the provided `{ "responses": [...] }` shape. |
 | `progress_update` | Subagent is sharing meaningful progress or a plan-changing discovery. Not blocking. | Read and acknowledge. No reply required unless you want to redirect. |
 
 **When a subagent asks:**
@@ -197,7 +212,7 @@ it as a `contact_supervisor` escalation.
 | Action | Behavior | Use When |
 |--------|----------|----------|
 | `send` | Fire-and-forget | You don't need a response |
-| `ask` | Blocks until reply (10 min timeout) | You need an answer to continue |
+| `ask` | Waits up to 30 seconds, then continues asynchronously | You need an answer but should not hold the agent indefinitely |
 | `reply` | Responds to the active or pending inbound ask | You were asked something and need to answer naturally |
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
 | `list` | Returns all sessions with live status | You need to discover targets or choose an idle peer |
@@ -301,8 +316,10 @@ If neither `cmux` nor `tmux` is available, skip this path and use normal `interc
 
 ### `ask` Limitations
 
-- **10-minute timeout**: If no reply comes within 10 minutes, the ask fails
-- **One at a time**: Cannot have multiple pending asks from the same session
+- **30-second soft wait**: If no reply arrives, the tool returns a successful pending result and the agent continues
+- **10-minute reply window**: The recipient can still answer later; the reply arrives as a new intercom message
+- **One synchronous wait at a time**: Another ask can start after the soft wait releases the current one
+- **Deferred is not cancelled**: After the soft wait, reverse asks are allowed and the original request stays late-replyable, including across broker restart
 - **Cannot self-target**: A session cannot ask itself
 
 ```typescript
@@ -315,24 +332,27 @@ if (result.isError && result.content[0].text.includes("Already waiting")) {
 
 ### `send` Behavior
 
-- **No timeout**: Message is delivered or fails immediately
+- **No reply wait**: `send` waits only until the receiver durably queues and acknowledges the message; it never waits for a conversational reply
+- **Structured delivery**: `accepted` means broker-accepted, while `delivered` means receiver-acknowledged
+- **Burst batching**: Nearby inbound messages become one recipient turn after 300 ms quiet, capped at 1 second
 - **Confirmation dialogs**: If `confirmSend: true` in config, interactive sessions show a confirmation dialog
 - **Replies skip confirmation**: Messages with `replyTo` never show confirmation dialogs
 
 ## Best Practices
 
-### Use `ask` for blocking workflows
+### Use `ask` for decision workflows
 
 When the worker needs information to proceed:
 
 ```typescript
-// GOOD: Worker blocks until planner responds
+// GOOD: Worker waits briefly for a prompt decision
 const reply = await intercom({
   action: "ask",
   to: "planner",
   message: "API rate limit is 100/min. Should I implement client-side throttling or batching?"
 });
-// Continue with the answer...
+// If reply.details?.pending is true, continue only with work that does not depend on the answer.
+// A late answer will arrive as a new intercom message.
 ```
 
 ### Use `send` for notifications
@@ -403,11 +423,13 @@ if (!result.delivered) {
 }
 ```
 
-**Ask timeout (after 10 minutes)**
+**Ask continues asynchronously after 30 seconds**
 ```typescript
-// The ask will reject with a timeout error
-// Design your workflow so answers come within 10 minutes
-// For longer tasks, use send + follow-up ask pattern
+const result = await intercom({ action: "ask", to: "planner", message: "..." });
+if (result.details?.pending) {
+  // The message was delivered, but no prompt reply arrived.
+  // Continue independent work; a late reply will trigger a new intercom message.
+}
 ```
 
 ## Troubleshooting
@@ -490,7 +512,7 @@ intercom({ action: "send", to: "planner", message: "Task-3 complete. All done." 
 ### Long-Running Task with Checkpoints
 
 ```typescript
-// For tasks that might exceed 10 minutes, use send + periodic asks
+// For long tasks, use send for progress and ask only for concrete decisions
 
 // 1. Initial send with full context
 intercom({
@@ -508,5 +530,5 @@ const decision = await intercom({
   to: "planner",
   message: "Should we use JWT or session cookies? Need decision to continue."
 });
-// Continue with decision...
+// Continue with the decision when prompt; otherwise continue only independent work.
 ```

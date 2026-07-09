@@ -4,7 +4,16 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- Added a durable per-session inbound inbox with atomic persistence, ordered recovery, receiver-side deduplication, and inbox/pending counts in presence and status.
+- Added burst batching: messages arriving within a 300 ms quiet window are delivered in one model turn, with a 1-second maximum delay and full original sender/message/reply metadata.
+- Added strict protocol-v2 negotiation, delivery IDs, receiver acknowledgements, `accepted` versus `delivered` results, structured failure codes, retry deduplication, payload limits, and bounded pending work.
+- Added durable deferred-ask authorization across broker restarts, searchable session selection, multiline compose/paste, shortest unique ID prefixes, terminal metadata sanitization, package-content tests, typechecking, and CI.
+
 ### Changed
+- `ask`, `need_decision`, and `interview_request` now wait synchronously for 30 seconds by default, then return control while keeping the delivered request open for a late asynchronous reply. Configure the blocking window with `PI_INTERCOM_ASK_WAIT_MS`; the existing 10-minute ask expiry remains unchanged.
+- Timed-out asks now become explicitly deferred: they no longer block reverse asks, can be cancelled or expire with receiver notification, and remain replyable asynchronously.
+- Incoming messages now acknowledge delivery only after durable enqueue and are queued even for busy non-interactive sessions.
 - Updated Pi runtime peer metadata and tool schemas for the `@earendil-works` package scope and Pi-bundled `typebox`/`pi-ai` packages.
 - Centralized pi-intercom runtime and config paths under `PI_CODING_AGENT_DIR` when set, defaulting to `~/.pi/agent`.
 - Hardened default broker auto-spawn to launch the resolved bundled `tsx` CLI through the current Node executable instead of resolving `npx` through `PATH`; custom `brokerCommand`/`brokerArgs` remain available as advanced trusted config.
@@ -12,6 +21,8 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Made inline intercom messages collapse and expand with Pi's `Ctrl+O` custom-message toggle while keeping sender, preview, reply, and attachment cues visible. Thanks to RyanKim17920 for PR #32.
 
 ### Fixed
+- Prevented bursts of inbound messages from creating one model turn per frame or losing all but the first message while a session is busy.
+- Preserved late-reply authorization across broker restart by restoring saved asks as non-blocking deferred edges.
 - Added broker-owned local trust metadata, clearer stable-ID trust boundaries for duplicate names, per-connection rate limiting, and no-op presence coalescing for local IPC abuse hardening.
 - Added an inbound broker frame size cap to reject oversized local IPC messages before buffering their payloads.
 - Restricted Unix intercom runtime directory, socket, PID, and spawn-lock permissions.

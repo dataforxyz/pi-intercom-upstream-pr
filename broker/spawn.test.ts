@@ -123,8 +123,8 @@ test("getBrokerSpawnOptions passes an absolute PI_CODING_AGENT_DIR to the broker
 });
 
 test("isBrokerHealthOkMessage requires the intercom protocol marker", () => {
-  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1", protocol: "pi-intercom", version: 1 }, "req-1"), true);
+  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1", protocol: "pi-intercom", version: 2 }, "req-1"), true);
   assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1" }, "req-1"), false);
-  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-2", protocol: "pi-intercom", version: 1 }, "req-1"), false);
+  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-2", protocol: "pi-intercom", version: 2 }, "req-1"), false);
   assert.equal(isBrokerHealthOkMessage("ok", "req-1"), false);
 });
