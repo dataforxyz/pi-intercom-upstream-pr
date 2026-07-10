@@ -34,6 +34,8 @@ pi install npm:pi-intercom
 
 Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
 
+Pi loads the extension directly, including its native **Alt+I** contact-copy shortcut, so no wrapper command or shell alias is required. You can still alias your usual Pi invocation for convenience, but unlike adapters that need a wrapper to add terminal behavior, an alias does not enable any additional pi-intercom features.
+
 **Recommended:** Add this snippet to your project's `AGENTS.md` to help agents understand when to coordinate across sessions:
 
 ```xml
