@@ -36,6 +36,8 @@ Then restart Pi. The extension auto-connects to the broker on startup and regist
 
 Pi loads the extension directly, including its native **Alt+I** contact-copy shortcut, so no wrapper command or shell alias is required. You can still alias your usual Pi invocation for convenience, but unlike adapters that need a wrapper to add terminal behavior, an alias does not enable any additional pi-intercom features.
 
+Pi-intercom is also protocol-compatible with the companion Codex, Claude, and OpenCode adapters. They share the same local broker and runtime directory, so sessions from all four hosts appear in the same session list and can send, ask, reply, and recover messages across host boundaries. The first connected adapter can start the broker; Pi does not need to be launched first.
+
 **Recommended:** Add this snippet to your project's `AGENTS.md` to help agents understand when to coordinate across sessions:
 
 ```xml
@@ -61,6 +63,19 @@ The session list only shows intercom-connected sessions, not every open Pi proce
 If a session is unnamed, pi-intercom now exposes a runtime-only fallback alias like `subagent-chat-1a2b3c4d` so other sessions can still target it. That alias is not persisted as the Pi session title, so `pi --resume` can keep showing the transcript snippet instead of a generic `session-...` name.
 
 ## Quick Start
+
+### Common Interface Across Hosts
+
+The intercom packages use the same keyboard convention wherever the host exposes the required terminal hooks:
+
+| Action | Pi | Codex (`coi`) | Claude (`cci`/`ccim`) | OpenCode |
+|--------|----|---------------|------------------------|----------|
+| Pick a session and send | `/intercom` or **Alt+M** | **Alt+M** | `/claude-intercom:intercom` or **Alt+M** | `/intercom` or **Alt+M** |
+| Copy this session's contact target | `/intercom-id` or **Alt+I** | **Alt+I** | `/claude-intercom:intercom-id` or **Alt+I** | `/intercom-id` or **Alt+I** |
+
+Codex does not currently expose a native custom slash-command API, so its `coi` wrapper provides the shared keyboard shortcuts instead. Claude namespaces installed plugin commands and its terminal shortcuts require the attached `cci` or `ccim` wrapper. For those adapters, a shell alias is recommended because it makes the wrapper the normal launch command and ensures the shortcuts and wakeable intercom behavior are present. Pi loads those features natively, so an alias is optional here.
+
+The contact text copied by **Alt+I** or `/intercom-id` is deliberately host-neutral. Paste it into any supported agent to identify the exact target without requiring that agent to look the session up by a machine-specific path or transient display label.
 
 ### From the Keyboard
 
